@@ -376,6 +376,14 @@ public class GpuParticles2D : Node2D
 {
     public bool Emitting { get; set; }
     public Material? ProcessMaterial { get; set; }
+    // build 23372702 sets Amount on enemy/VFX particles (e.g. BygoneEffigy); without
+    // this no-op stub the JIT throws "Method not found: set_Amount" mid enemy turn,
+    // derailing the async turn continuation and forcing the EndTurn nuclear fallback.
+    public int Amount { get; set; } = 1;
+    public double Lifetime { get; set; } = 1.0;
+    public bool OneShot { get; set; }
+    public float Explosiveness { get; set; }
+    public Texture2D? Texture { get; set; }
 }
 
 // Sprite
