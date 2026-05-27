@@ -1006,20 +1006,29 @@ public class RunSimulator
         return DetectDecisionPoint();
     }
 
+    // STS2 build 23372702 removed CombatManager.IsPlayPhase (global) in favor of a
+    // per-player PlayerCombatState.Phase. Headless is single-player, so the local
+    // player (Players[0]) being in the Play phase is the equivalent signal.
+    private bool IsPlayPhase()
+    {
+        var p = (_runState != null && _runState.Players.Count > 0) ? _runState.Players[0] : null;
+        return p?.PlayerCombatState?.Phase == MegaCrit.Sts2.Core.Combat.PlayerTurnPhase.Play;
+    }
+
     private Dictionary<string, object?> DoEndTurn(Player player)
     {
-        if (!CombatManager.Instance.IsPlayPhase)
+        if (!IsPlayPhase())
         {
             // Might be between phases — pump and check
             _syncCtx.Pump();
-            if (!CombatManager.Instance.IsPlayPhase)
+            if (!IsPlayPhase())
             {
                 if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead)
                     return DetectDecisionPoint();
                 // Brief wait for ThreadPool if sync context didn't catch it
                 Thread.Sleep(100);
                 _syncCtx.Pump();
-                if (!CombatManager.Instance.IsPlayPhase)
+                if (!IsPlayPhase())
                     return DetectDecisionPoint();
             }
         }
@@ -1043,14 +1052,14 @@ public class RunSimulator
             _syncCtx.Pump();
 
             // Fallback: if turn didn't complete synchronously, keep pumping with SuppressYield on
-            if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
+            if (CombatManager.Instance.IsInProgress && !IsPlayPhase() && !player.Creature.IsDead)
             {
                 for (int i = 0; i < 50; i++)
                 {
                     _syncCtx.Pump();
                     if (_turnStarted.IsSet || _combatEnded.IsSet) break;
                     if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
-                    if (CombatManager.Instance.IsPlayPhase) break;
+                    if (IsPlayPhase()) break;
                     Thread.Sleep(5);
                 }
             }
@@ -1062,7 +1071,7 @@ public class RunSimulator
 
         // Second fallback: if still stuck after SuppressYield window, cancel and retry.
         // The WaitUntilQueue TCS is likely deadlocked.
-        if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
+        if (CombatManager.Instance.IsInProgress && !IsPlayPhase() && !player.Creature.IsDead)
         {
             Log("EndTurn stuck, cancelling and retrying with SuppressYield...");
             try
@@ -1092,7 +1101,7 @@ public class RunSimulator
                     _syncCtx.Pump();
                     if (_turnStarted.IsSet || _combatEnded.IsSet) break;
                     if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
-                    if (CombatManager.Instance.IsPlayPhase) break;
+                    if (IsPlayPhase()) break;
                     Thread.Sleep(10);
                 }
             }
@@ -1100,14 +1109,14 @@ public class RunSimulator
 
             // NUCLEAR OPTION: If STILL stuck after 2 attempts, use ThreadPool to force
             // the enemy turn processing to complete with SuppressYield permanently on.
-            if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
+            if (CombatManager.Instance.IsInProgress && !IsPlayPhase() && !player.Creature.IsDead)
             {
                 var stuckState = CombatManager.Instance.DebugOnlyGetState();
                 var stuckEnemies = stuckState?.Enemies?.Where(e => e != null && e.IsAlive)
                     .Select(e => $"{e.Monster?.GetType().Name}(hp={e.CurrentHp})").ToList();
                 Log($"EndTurn STILL stuck after retry — nuclear fallback. Round={stuckState?.RoundNumber}, " +
                     $"Enemies=[{string.Join(",", stuckEnemies ?? new())}], " +
-                    $"IsPlayPhase={CombatManager.Instance.IsPlayPhase}, " +
+                    $"IsPlayPhase={IsPlayPhase()}, " +
                     $"IsInProgress={CombatManager.Instance.IsInProgress}, " +
                     $"ActionExecutor.IsRunning={RunManager.Instance.ActionExecutor.IsRunning}");
                 try
@@ -1133,24 +1142,24 @@ public class RunSimulator
                         if (endTurnTask.IsCompleted) break;
                         if (_turnStarted.IsSet || _combatEnded.IsSet) break;
                         if (!CombatManager.Instance.IsInProgress || player.Creature.IsDead) break;
-                        if (CombatManager.Instance.IsPlayPhase) break;
+                        if (IsPlayPhase()) break;
                         Thread.Sleep(10);
                     }
                     YieldPatches.SuppressYield = false;
 
                     // If still not play phase, try just waiting a bit more
-                    if (CombatManager.Instance.IsInProgress && !CombatManager.Instance.IsPlayPhase && !player.Creature.IsDead)
+                    if (CombatManager.Instance.IsInProgress && !IsPlayPhase() && !player.Creature.IsDead)
                     {
                         for (int i = 0; i < 200; i++)
                         {
                             _syncCtx.Pump();
                             Thread.Sleep(10);
-                            if (CombatManager.Instance.IsPlayPhase || !CombatManager.Instance.IsInProgress || player.Creature.IsDead)
+                            if (IsPlayPhase() || !CombatManager.Instance.IsInProgress || player.Creature.IsDead)
                                 break;
                         }
                     }
 
-                    if (CombatManager.Instance.IsPlayPhase)
+                    if (IsPlayPhase())
                         Log("Nuclear fallback SUCCEEDED — play phase resumed");
                     else
                     {
@@ -1242,8 +1251,8 @@ public class RunSimulator
             return Error("buy_card requires 'card_index'");
 
         var idx = Convert.ToInt32(args["card_index"]);
-        var allEntries = merchantRoom.Inventory.CharacterCardEntries
-            .Concat(merchantRoom.Inventory.ColorlessCardEntries).ToList();
+        var allEntries = merchantRoom.GetLocalInventory().CharacterCardEntries
+            .Concat(merchantRoom.GetLocalInventory().ColorlessCardEntries).ToList();
         if (idx < 0 || idx >= allEntries.Count)
             return Error($"Invalid card index {idx}");
 
@@ -1253,7 +1262,7 @@ public class RunSimulator
 
         try
         {
-            entry.OnTryPurchaseWrapper(merchantRoom.Inventory).GetAwaiter().GetResult();
+            entry.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()).GetAwaiter().GetResult();
             _syncCtx.Pump();
             Log($"Bought card: {entry.CreationResult?.Card?.GetType().Name ?? "?"} for {entry.Cost}g");
         }
@@ -1270,7 +1279,7 @@ public class RunSimulator
             return Error("buy_relic requires 'relic_index'");
 
         var idx = Convert.ToInt32(args["relic_index"]);
-        var entries = merchantRoom.Inventory.RelicEntries;
+        var entries = merchantRoom.GetLocalInventory().RelicEntries;
         if (idx < 0 || idx >= entries.Count) return Error($"Invalid relic index {idx}");
 
         var entry = entries[idx];
@@ -1279,7 +1288,7 @@ public class RunSimulator
 
         try
         {
-            entry.OnTryPurchaseWrapper(merchantRoom.Inventory).GetAwaiter().GetResult();
+            entry.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()).GetAwaiter().GetResult();
             _syncCtx.Pump();
             Log($"Bought relic: {entry.Model.GetType().Name} for {entry.Cost}g");
         }
@@ -1296,7 +1305,7 @@ public class RunSimulator
             return Error("buy_potion requires 'potion_index'");
 
         var idx = Convert.ToInt32(args["potion_index"]);
-        var entries = merchantRoom.Inventory.PotionEntries;
+        var entries = merchantRoom.GetLocalInventory().PotionEntries;
         if (idx < 0 || idx >= entries.Count) return Error($"Invalid potion index {idx}");
 
         var entry = entries[idx];
@@ -1305,7 +1314,7 @@ public class RunSimulator
 
         try
         {
-            entry.OnTryPurchaseWrapper(merchantRoom.Inventory).GetAwaiter().GetResult();
+            entry.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()).GetAwaiter().GetResult();
             _syncCtx.Pump();
             Log($"Bought potion: {entry.Model.GetType().Name} for {entry.Cost}g");
         }
@@ -1323,14 +1332,14 @@ public class RunSimulator
         if (_runState?.CurrentRoom is not MerchantRoom merchantRoom)
             return Error("Not in a shop");
 
-        var removal = merchantRoom.Inventory.CardRemovalEntry;
+        var removal = merchantRoom.GetLocalInventory().CardRemovalEntry;
         if (removal == null) return Error("No card removal available");
         if (player.Gold < removal.Cost) return Error("Not enough gold");
 
         try
         {
             // Run on background thread so card selection can pause (same pattern as event options)
-            var task = Task.Run(() => removal.OnTryPurchaseWrapper(merchantRoom.Inventory));
+            var task = Task.Run(() => removal.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()));
             for (int i = 0; i < 100; i++)
             {
                 _syncCtx.Pump();
@@ -1825,7 +1834,7 @@ public class RunSimulator
                 goto checkCardSelect;  // Jump back to card_select handling
             }
 
-            if (CombatManager.Instance.IsInProgress && CombatManager.Instance.IsPlayPhase)
+            if (CombatManager.Instance.IsInProgress && IsPlayPhase())
             {
                 return CombatPlayState(player);
             }
@@ -1838,7 +1847,7 @@ public class RunSimulator
             {
                 _syncCtx.Pump();
                 Thread.Sleep(5);
-                if (CombatManager.Instance.IsPlayPhase) return CombatPlayState(player);
+                if (IsPlayPhase()) return CombatPlayState(player);
                 if (!CombatManager.Instance.IsInProgress) return DetectPostCombatState(player, combatRoom);
             }
             return CombatPlayState(player);
@@ -2176,7 +2185,10 @@ public class RunSimulator
             try
             {
                 var rewardsSet = new RewardsSet(player).WithRewardsFromRoom(combatRoom);
-                var rewards = rewardsSet.GenerateWithoutOffering().GetAwaiter().GetResult();
+                // build 23372702: GenerateWithoutOffering() now returns Task (void);
+                // generated rewards live on rewardsSet.Rewards afterwards.
+                rewardsSet.GenerateWithoutOffering().GetAwaiter().GetResult();
+                var rewards = rewardsSet.Rewards;
                 _syncCtx.Pump();
 
                 // Auto-collect gold and potions, but present card choices to agent
@@ -2186,7 +2198,7 @@ public class RunSimulator
                     if (reward is GoldReward || reward is MegaCrit.Sts2.Core.Rewards.RelicReward
                         || reward is MegaCrit.Sts2.Core.Rewards.PotionReward)
                     {
-                        try { reward.OnSelectWrapper().GetAwaiter().GetResult(); _syncCtx.Pump(); }
+                        try { reward.SelectUnsynchronized().GetAwaiter().GetResult(); _syncCtx.Pump(); }
                         catch (Exception ex) { Log($"Auto-collect reward: {ex.Message}"); }
                     }
                     else if (reward is CardReward cr)
@@ -2488,7 +2500,7 @@ public class RunSimulator
 
     private Dictionary<string, object?> ShopState(MerchantRoom merchantRoom, Player player)
     {
-        var inv = merchantRoom.Inventory;
+        var inv = merchantRoom.GetLocalInventory();
         if (inv == null) { ForceToMap(); return MapSelectState(); }
 
         var cards = inv.CharacterCardEntries.Concat(inv.ColorlessCardEntries)
@@ -2545,7 +2557,7 @@ public class RunSimulator
             ["is_stocked"] = e.IsStocked,
         }).ToList();
 
-        var removal = merchantRoom.Inventory.CardRemovalEntry;
+        var removal = merchantRoom.GetLocalInventory().CardRemovalEntry;
 
         return new Dictionary<string, object?>
         {
@@ -2661,9 +2673,9 @@ public class RunSimulator
         {
             _syncCtx.Pump();
             if (!CombatManager.Instance.IsInProgress) return;
-            if (CombatManager.Instance.IsPlayPhase) return;
+            if (IsPlayPhase()) return;
             WaitForActionExecutor();
-            if (CombatManager.Instance.IsPlayPhase || !CombatManager.Instance.IsInProgress) return;
+            if (IsPlayPhase() || !CombatManager.Instance.IsInProgress) return;
             Thread.Sleep(5);
         }
     }
@@ -2821,6 +2833,12 @@ public class RunSimulator
         try { SaveManager.Instance.InitProfileId(0); }
         catch (Exception ex) { Console.Error.WriteLine($"[WARN] SaveManager.InitProfileId: {ex.Message}"); }
 
+        // Initialize PrefsSave (FastMode etc.). build 23372702 reads PrefsSave.FastMode
+        // from many gameplay paths (e.g. Slice.OnPlay anim delay); without this the
+        // PrefsSave getter returns null and those paths NRE.
+        try { SaveManager.Instance.InitPrefsDataForTest(); }
+        catch (Exception ex) { Console.Error.WriteLine($"[WARN] SaveManager.InitPrefsDataForTest: {ex.Message}"); }
+
         // Initialize progress data for epoch/timeline tracking
         try { SaveManager.Instance.InitProgressData(); }
         catch (Exception ex) { Console.Error.WriteLine($"[WARN] InitProgressData: {ex.Message}"); }
@@ -2834,6 +2852,10 @@ public class RunSimulator
         // Vantom's Dismember move adding Wounds). In headless mode, these never complete
         // because there's no Godot scene tree, causing the ActionExecutor to deadlock.
         PatchCmdWait();
+
+        // Patch TalkCmd.Play to a no-op (issue #64). Monster speech-bubble VFX during
+        // moves (e.g. BygoneEffigy.WakeMove) NRE in headless and break the enemy turn.
+        PatchTalkCmd();
 
         // Initialize localization system (needed for events, cards, etc.)
         InitLocManager();
@@ -2954,6 +2976,33 @@ public class RunSimulator
         }
     }
 
+    private static void PatchTalkCmd()
+    {
+        try
+        {
+            var harmony = new Harmony("sts2headless.talkpatch");
+            var talkType = typeof(CombatManager).Assembly.GetType("MegaCrit.Sts2.Core.Commands.TalkCmd");
+            var playMethod = talkType?.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
+                .FirstOrDefault(m => m.Name == "Play");
+            if (playMethod == null)
+            {
+                Console.Error.WriteLine("[WARN] Could not find TalkCmd.Play to patch");
+                return;
+            }
+            var prefix = typeof(YieldPatches).GetMethod(nameof(YieldPatches.TalkCmdPlayPrefix),
+                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
+            if (prefix != null)
+            {
+                harmony.Patch(playMethod, new HarmonyMethod(prefix));
+                Console.Error.WriteLine("[INFO] Patched TalkCmd.Play() to no-op (prevents enemy-move VFX crash, issue #64)");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARN] Failed to patch TalkCmd.Play: {ex.Message}");
+        }
+    }
+
     private static void PatchTaskYield()
     {
         try
@@ -3058,11 +3107,15 @@ public class RunSimulator
         private ManualResetEventSlim? _rewardWait;
         private int _rewardChoice = -1;
 
-        public CardModel? GetSelectedCardReward(
+        // NOTE: STS2 build 23372702 changed ICardSelector.GetSelectedCardReward to return
+        // a CardRewardSelection struct { CardModel card; CardRewardAlternative alternative }.
+        // CardReward.OnSelect interprets: alternative != null → pick that alternative
+        // (Skip/Reroll); else card != null → take that card; both null → skip (no card kept).
+        public MegaCrit.Sts2.Core.TestSupport.CardRewardSelection GetSelectedCardReward(
             IReadOnlyList<MegaCrit.Sts2.Core.Entities.Cards.CardCreationResult> options,
             IReadOnlyList<CardRewardAlternative> alternatives)
         {
-            if (options.Count == 0) return null;
+            if (options.Count == 0) return default;  // Skip
 
             // Store pending and block until main loop resolves
             PendingRewardCards = options.ToList();
@@ -3077,8 +3130,8 @@ public class RunSimulator
             _rewardWait = null;
 
             if (choice >= 0 && choice < options.Count)
-                return options[choice].Card;
-            return null;  // Skip
+                return new MegaCrit.Sts2.Core.TestSupport.CardRewardSelection { card = options[choice].Card };
+            return default;  // Skip (card=null, alternative=null)
         }
 
         public bool HasPendingReward => PendingRewardCards != null && _rewardWait != null;
@@ -3115,6 +3168,19 @@ public class RunSimulator
         public static bool CmdWaitPrefix(ref Task __result)
         {
             __result = Task.CompletedTask;
+            return false; // Skip original method
+        }
+
+        /// <summary>
+        /// Harmony prefix: no-op TalkCmd.Play (issue #64). The speech-bubble VFX
+        /// (NSpeechBubbleVfx.Create + GetVfxContainer().AddChildSafely) NREs in headless,
+        /// which derails enemy moves like BygoneEffigy.WakeMove mid enemy turn and forces
+        /// the EndTurn nuclear fallback / false game_over. The bubble is purely cosmetic and
+        /// its return value is ignored by callers, so returning null is safe.
+        /// </summary>
+        public static bool TalkCmdPlayPrefix(ref MegaCrit.Sts2.Core.Nodes.Vfx.NSpeechBubbleVfx? __result)
+        {
+            __result = null;
             return false; // Skip original method
         }
     }
@@ -3409,8 +3475,8 @@ public class RunSimulator
             {
                 await CreatureCmd.Damage(ctx, play.Target!, card.DynamicVars.Damage.BaseValue,
                     MegaCrit.Sts2.Core.ValueProps.ValueProp.Move, card);
-                await PowerCmd.Apply<WeakPower>(play.Target!, card.DynamicVars["WeakPower"].BaseValue,
-                    card.Owner.Creature, card);
+                await PowerCmd.Apply<WeakPower>(ctx, play.Target!, card.DynamicVars["WeakPower"].BaseValue,
+                    card.Owner.Creature, card, false);
             }
             catch (Exception ex) { Console.Error.WriteLine($"[WARN] Neutralize safe: {ex.Message}"); }
         }
