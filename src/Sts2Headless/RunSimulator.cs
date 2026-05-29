@@ -2004,14 +2004,26 @@ public class RunSimulator
 
         var hand = pcs?.Hand?.Cards?.Select((c, i) =>
         {
-            // Extract actual stat values from DynamicVars
+            // Export the *currently resolved* stat values, not the card base: refresh the
+            // DynamicVar previews (mirrors NCard.UpdateVisuals) so damage reflects Strength/Weak,
+            // block reflects Frail, calculateddamage reflects current Block, etc. ClearPreview
+            // resets PreviewValue to BaseValue, and only damage/block/calculated vars override it,
+            // so reading PreviewValue uniformly is safe. Issues #65 #69 #70 #71 #74 #75.
             var stats = new Dictionary<string, object?>();
             try
             {
+                c.DynamicVars.ClearPreview();
+                c.UpdateDynamicVarPreview(
+                    MegaCrit.Sts2.Core.Entities.Cards.CardPreviewMode.Normal,
+                    c.CurrentTarget, c.DynamicVars);
                 foreach (var dv in c.DynamicVars.Values)
                 {
-                    stats[dv.Name.ToLowerInvariant()] = (int)dv.BaseValue;
+                    stats[dv.Name.ToLowerInvariant()] = (int)dv.PreviewValue;
                 }
+                // Restore the live card to base state. UpdateDynamicVarPreview mutates the
+                // card's preview (and for self-cost cards like Momentum Strike, leaving it in
+                // preview state corrupts the subsequent PlayCardAction — card stays in hand).
+                c.DynamicVars.ClearPreview();
             }
             catch { }
 
