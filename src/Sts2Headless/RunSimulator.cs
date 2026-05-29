@@ -2002,6 +2002,11 @@ public class RunSimulator
         if (player.Creature != null && player.Creature.CurrentHp > 0)
             _lastKnownHp = player.Creature.CurrentHp;
 
+        // Alive enemies in the same order play_card's AnyEnemy targeting uses, so
+        // damage_by_target[i].target_index aligns with the target_index clients pass.
+        var aliveEnemiesForTargeting = combatState?.Enemies?
+            .Where(e => e != null && e.IsAlive).ToList() ?? new();
+
         var hand = pcs?.Hand?.Cards?.Select((c, i) =>
         {
             // Export the *currently resolved* stat values, not the card base: refresh the
@@ -2026,6 +2031,57 @@ public class RunSimulator
                 c.DynamicVars.ClearPreview();
             }
             catch { }
+
+            // Per-target resolved damage for attack cards: the scalar `stats` above use the
+            // card's CurrentTarget, but a single value can't capture target-specific modifiers
+            // (Vulnerable #60, Slow #77) or conditional hit counts (Dismantle #78, X-cost
+            // Whirlwind #82). Re-run the preview per enemy via MultiCreatureTargeting, the same
+            // path the game uses to draw multi-target previews, and read the resolved vars.
+            List<Dictionary<string, object?>>? damageByTarget = null;
+            if (c.Type == CardType.Attack && aliveEnemiesForTargeting.Count > 0
+                && (c.TargetType == TargetType.AnyEnemy || c.TargetType == TargetType.AllEnemies))
+            {
+                damageByTarget = new List<Dictionary<string, object?>>();
+                for (int ti = 0; ti < aliveEnemiesForTargeting.Count; ti++)
+                {
+                    var tgt = aliveEnemiesForTargeting[ti];
+                    try
+                    {
+                        c.DynamicVars.ClearPreview();
+                        c.UpdateDynamicVarPreview(
+                            MegaCrit.Sts2.Core.Entities.Cards.CardPreviewMode.MultiCreatureTargeting,
+                            tgt, c.DynamicVars);
+                        var tstats = new Dictionary<string, object?>();
+                        foreach (var dv in c.DynamicVars.Values)
+                            tstats[dv.Name.ToLowerInvariant()] = (int)dv.PreviewValue;
+
+                        // Per-hit damage = calculateddamage (override cards) or damage.
+                        int? perHit = tstats.TryGetValue("calculateddamage", out var cdv) && cdv is int cdi && cdi > 0
+                            ? cdi
+                            : (tstats.TryGetValue("damage", out var dv2) && dv2 is int di ? di : (int?)null);
+                        // Hit count: explicit `repeat` var if present, else for X-cost attacks
+                        // the hit count is the current X (= available energy), e.g. Whirlwind (#82).
+                        int repeat = tstats.TryGetValue("repeat", out var rv) && rv is int ri && ri > 0 ? ri : 1;
+                        if (repeat == 1 && c.EnergyCost?.CostsX == true && pcs != null)
+                            repeat = pcs.Energy;
+
+                        var row = new Dictionary<string, object?>
+                        {
+                            ["target_index"] = ti,
+                            ["name"] = _loc.Monster(tgt.Monster?.Id.Entry ?? "UNKNOWN"),
+                        };
+                        if (perHit != null) row["damage"] = perHit;
+                        if (repeat > 1)
+                        {
+                            row["repeat"] = repeat;
+                            if (perHit != null) row["total_damage"] = perHit * repeat;
+                        }
+                        damageByTarget.Add(row);
+                    }
+                    catch { }
+                    finally { c.DynamicVars.ClearPreview(); }
+                }
+            }
 
             // Use CurrentStarCost (combat-modified) for UI/can_play; BaseStarCost ignores temporary reductions.
             var starCost = c.CurrentStarCost;
@@ -2061,6 +2117,8 @@ public class RunSimulator
                 cardInfo["affliction"] = _loc.Bilingual("afflictions", c.Affliction.Id.Entry + ".title");
                 try { if (c.Affliction.Amount != 0) cardInfo["affliction_amount"] = c.Affliction.Amount; } catch { }
             }
+            if (damageByTarget != null && damageByTarget.Count > 0)
+                cardInfo["damage_by_target"] = damageByTarget;
             return cardInfo;
         }).ToList() ?? new();
 
@@ -2087,8 +2145,22 @@ public class RunSimulator
                             {
                                 try
                                 {
-                                    intentInfo["damage"] = atk.GetTotalDamage(playerCreatures, e);
-                                    if (atk.Repeats > 1) intentInfo["hits"] = atk.Repeats;
+                                    // For multi-hit attacks, expose per-hit `damage` (matching the
+                                    // game's intent description, which pairs GetSingleDamage with
+                                    // Repeat) plus an explicit `total_damage`. Reporting the total in
+                                    // `damage` while also reporting `hits` let clients compute
+                                    // damage*hits and double-count incoming damage (#67).
+                                    var hits = atk.Repeats;
+                                    if (hits > 1)
+                                    {
+                                        intentInfo["damage"] = atk.GetSingleDamage(playerCreatures, e);
+                                        intentInfo["hits"] = hits;
+                                        intentInfo["total_damage"] = atk.GetTotalDamage(playerCreatures, e);
+                                    }
+                                    else
+                                    {
+                                        intentInfo["damage"] = atk.GetTotalDamage(playerCreatures, e);
+                                    }
                                 }
                                 catch { }
                             }
