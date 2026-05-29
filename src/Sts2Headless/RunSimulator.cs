@@ -1032,6 +1032,15 @@ public class RunSimulator
 
     private Dictionary<string, object?> DoEndTurn(Player player)
     {
+        // A pending card / card-reward / bundle selection is an unresolved prompt; ending
+        // the turn here would silently mutate combat instead. Surface the prompt unchanged
+        // and let the caller resolve it first (#61).
+        if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
+        {
+            Log("end_turn ignored: a card selection is pending");
+            return DetectDecisionPoint();
+        }
+
         if (!IsPlayPhase())
         {
             // Might be between phases — pump and check
@@ -1303,7 +1312,26 @@ public class RunSimulator
 
         try
         {
-            entry.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()).GetAwaiter().GetResult();
+            // The pickup effect can open a card_select (e.g. KIFUDA → enchant up to 3 with
+            // Adroit, #80). Run the purchase on a background task and yield as soon as a
+            // pending selection appears so the caller can resolve it; the background task
+            // continues once the selector's TCS is fed by select_cards.
+            var inv = merchantRoom.GetLocalInventory();
+            var task = Task.Run(() => entry.OnTryPurchaseWrapper(inv));
+            for (int i = 0; i < 100; i++)
+            {
+                _syncCtx.Pump();
+                if (_cardSelector.HasPending || _cardSelector.HasPendingReward) break;
+                if (_pendingBundles != null) break;
+                if (task.IsCompleted) break;
+                Thread.Sleep(10);
+            }
+            if (_cardSelector.HasPending || _cardSelector.HasPendingReward || _pendingBundles != null)
+            {
+                Log($"Buy relic {entry.Model.GetType().Name}: yielded for pending selection");
+                return DetectDecisionPoint();
+            }
+            if (!task.IsCompleted) task.Wait(2000);
             _syncCtx.Pump();
             Log($"Bought relic: {entry.Model.GetType().Name} for {entry.Cost}g");
         }
@@ -1639,12 +1667,10 @@ public class RunSimulator
                     catch (Exception ex) { Log($"Event choose: {ex.Message}"); }
                 }
 
-                var optCountAfter = localEvent.CurrentOptions?.Count ?? 0;
-                if (!localEvent.IsFinished && optCountAfter == optCountBefore && optCountAfter > 0)
-                {
-                    Log($"Event {localEvent.GetType().Name} didn't advance, force-finishing");
-                    ForceToMap();
-                }
+                // Note: do NOT force-finish on `optCountAfter == optCountBefore`. Events can
+                // legitimately stay interactive with the same option count (Slippery Bridge
+                // Hold On loops until Overcome is chosen, #59). Trust IsFinished and let the
+                // next DetectDecisionPoint return the current options for the next choice.
             }
         }
 
@@ -2329,9 +2355,17 @@ public class RunSimulator
         _pendingRewards = null;
         _rewardsProcessed = true;
 
-        // Boss → next act
+        // Boss → next act, OR final victory after the last act's boss (#81). Act index is
+        // 0-based and STS2 has 3 acts (0/1/2); killing the Act-3 (index 2) boss has no next
+        // act — EnterNextAct NREs and DetectDecisionPoint falls through to an empty
+        // map_select. Report victory directly in that case.
         if (combatRoom.RoomType == RoomType.Boss)
         {
+            if (_runState != null && _runState.CurrentActIndex >= 2)
+            {
+                Log($"Final boss defeated (Act {_runState.CurrentActIndex + 1}), reporting victory");
+                return GameOverState(true);
+            }
             Log("Boss defeated, entering next act");
             try
             {
@@ -2406,22 +2440,11 @@ public class RunSimulator
         var localEvent = RunManager.Instance.EventSynchronizer?.GetLocalEvent();
         _syncCtx.Pump();
 
-        // If we already chose an event option and the event didn't advance, force-finish
-        if (_eventOptionChosen && localEvent != null && !localEvent.IsFinished)
-        {
-            var currentOpts = localEvent.CurrentOptions;
-            var sameOptions = currentOpts != null && currentOpts.Count > 0 &&
-                _lastEventOptionCount > 0 && currentOpts.Count == _lastEventOptionCount;
-            if (sameOptions)
-            {
-                Log($"Event {localEvent.GetType().Name}: same options after choice, force-finishing");
-                _eventOptionChosen = false;
-                ForceToMap();
-                return MapSelectState();
-            }
-            // Options changed — event advanced to next page, show new options
-            _eventOptionChosen = false;
-        }
+        // Reset the choice-tracking flag once we re-export the event state. Earlier this
+        // block force-finished events whose option count was unchanged, but that incorrectly
+        // killed legitimate loops like Slippery Bridge Hold On (#59). Rely on IsFinished
+        // instead and let DetectDecisionPoint show the current options for the next choice.
+        if (_eventOptionChosen) _eventOptionChosen = false;
 
         // If event is finished, proceed to map
         if (localEvent == null || localEvent.IsFinished)
