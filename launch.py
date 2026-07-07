@@ -33,7 +33,8 @@ def _load_char_titles() -> dict[str, str]:
 
 
 def _char_zh(titles: dict[str, str], cli_name: str) -> str:
-    return titles.get(cli_name.upper(), cli_name)
+    key = str(cli_name).rsplit(".", 1)[-1].upper()
+    return titles.get(key, cli_name)
 
 
 def _prompt_line(prompt: str) -> str:
@@ -68,22 +69,7 @@ def _collect_save_entries() -> list[dict]:
         if not os.path.isfile(path):
             continue
         st = os.stat(path)
-        if name.endswith(".json"):
-            try:
-                with open(path, encoding="utf-8") as f:
-                    d = json.load(f)
-                out.append({
-                    "kind": "replay",
-                    "path": path,
-                    "name": name,
-                    "mtime": st.st_mtime,
-                    "character": d.get("character", "?"),
-                    "seed": d.get("seed", "?"),
-                    "actions": len(d.get("actions", [])),
-                })
-            except (json.JSONDecodeError, OSError):
-                pass
-        elif name.endswith(".save"):
+        if name.endswith(".save"):
             try:
                 with open(path, encoding="utf-8") as f:
                     data = json.load(f)
@@ -116,14 +102,10 @@ def _collect_save_entries() -> list[dict]:
 
 def _format_entry(titles: dict[str, str], e: dict) -> str:
     ts = datetime.fromtimestamp(e["mtime"]).strftime("%Y-%m-%d %H:%M")
-    if e["kind"] == "replay":
-        ch = str(e.get("character", "?"))
-        zh = _char_zh(titles, ch)
-        return f"{e['name']}  |  {zh}  |  种子 {e['seed']}  |  {e['actions']} 步  |  {ts}"
     if e.get("broken"):
         return f"{e['name']}  |  （文件损坏或无法解析）  |  {ts}"
     cid = str(e.get("character_id", "?"))
-    zh = titles.get(cid.upper(), cid) if cid != "?" else "?"
+    zh = _char_zh(titles, cid) if cid != "?" else "?"
     return (
         f"{e['name']}  |  {zh}  |  进阶 {e['ascension']}  |  种子 {e['seed']}  |  {ts}"
     )
@@ -132,8 +114,16 @@ def _format_entry(titles: dict[str, str], e: dict) -> str:
 def _run_play(args: list[str], lang: str) -> int:
     cmd = [sys.executable, PLAY_PY, "--lang", lang, *args]
     # play.py 内 ROOT 由文件路径解析，不依赖 cwd；统一设为仓库根目录便于相对路径。
-    r = subprocess.run(cmd, cwd=ROOT)
-    return r.returncode
+    proc = subprocess.Popen(cmd, cwd=ROOT)
+    while True:
+        try:
+            return proc.wait()
+        except KeyboardInterrupt:
+            # The child play.py receives the same Ctrl+C and handles the save/quit
+            # prompt. Keep the launcher alive so it does not print a traceback while
+            # the child is exiting normally.
+            if proc.poll() is not None:
+                return proc.returncode
 
 
 def _menu_new_game(titles: dict[str, str], lang: str) -> None:
@@ -156,27 +146,21 @@ def _menu_new_game(titles: dict[str, str], lang: str) -> None:
 def _menu_load_save(titles: dict[str, str], lang: str) -> None:
     entries = _collect_save_entries()
     if not entries:
-        print("\n  saves/ 下没有 .save 或 .json 存档。请先在对局中存档或退出时选择保存。\n")
+        print("\n  saves/ 下没有 .save 存档。请先在对局中存档或退出时选择保存。\n")
         return
 
     print("\n── 读取存档（按修改时间从新到旧）──")
-    print("  [继续游戏] = 游戏原生 .save")
-    print("  [操作回放] = 对局内 save 命令生成的 .json\n")
+    print("  [继续游戏] = 游戏原生 .save\n")
     for i, e in enumerate(entries, 1):
-        tag = "继续游戏" if e["kind"] == "native" else "操作回放"
-        print(f"  {i:2}  [{tag}]  {_format_entry(titles, e)}")
+        print(f"  {i:2}  [继续游戏]  {_format_entry(titles, e)}")
     print(f"\n  0  返回上一级")
     choice = _pick_int("\n输入编号: ", 0, len(entries))
     if choice == 0:
         return
     sel = entries[choice - 1]
     rel = os.path.relpath(sel["path"], ROOT)
-    if sel["kind"] == "native":
-        print(f"\n以继续游戏方式加载：{rel}\n")
-        _run_play(["--continue", rel], lang)
-    else:
-        print(f"\n以操作回放方式加载：{rel}\n")
-        _run_play(["--load", rel], lang)
+    print(f"\n以继续游戏方式加载：{rel}\n")
+    _run_play(["--continue", rel], lang)
 
 
 def _main_interactive(lang: str) -> None:

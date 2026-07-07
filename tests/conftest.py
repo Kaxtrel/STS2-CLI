@@ -111,8 +111,11 @@ class Game:
             if dec == "map_select":
                 return state
             if dec == "event_choice":
+                if state.get("finished"):
+                    state = self.act("leave_room")
+                    continue
                 opts = [o for o in state["options"] if not o.get("is_locked")]
-                state = self.act("choose_option", option_index=opts[0]["index"])
+                state = self.act("choose_option", option_index=opts[0]["index"]) if opts else self.act("leave_room")
             elif dec == "card_reward":
                 state = self.act("skip_card_reward")
             elif dec == "bundle_select":

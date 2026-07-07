@@ -44,7 +44,7 @@ Type `help` in-game:
   quit     — quit
 
   Map:     enter path number (0, 1, 2)
-  Combat:  card index / e (end turn) / p0 (use potion)
+  Combat:  card index or 0,1 sequence / e (end turn) / p0 (use potion)
   Reward:  card index / s (skip)
   Rest:    option index
   Event:   option index / leave
@@ -68,7 +68,7 @@ dotnet run --project src/Sts2Headless/Sts2Headless.csproj
 {"cmd": "quit"}
 ```
 
-Each command returns a JSON decision point (`map_select` / `combat_play` / `card_reward` / `rest_site` / `event_choice` / `shop` / `game_over`). All names are in English.
+Each command returns a JSON decision point (`map_select` / `combat_play` / `card_reward` / `treasure` / `rest_site` / `event_choice` / `shop` / `game_over`). All names are in English.
 
 ## Game Logs
 
@@ -150,7 +150,7 @@ python3 python/play.py --character Silent      # 选择静默猎手
   quit     — 退出
 
   地图:    输入编号 (0, 1, 2)
-  战斗:    输入卡牌编号 / e 结束回合 / p0 使用药水
+  战斗:    输入卡牌编号或 0,1 连续出牌 / e 结束回合 / p0 使用药水
   奖励:    输入卡牌编号 / s 跳过
   休息:    输入选项编号
   事件:    输入选项编号 / leave 离开
@@ -184,7 +184,7 @@ dotnet run --project src/Sts2Headless/Sts2Headless.csproj
 {"cmd": "quit"}
 ```
 
-每个命令返回一个 JSON decision point（`map_select` / `combat_play` / `card_reward` / `rest_site` / `event_choice` / `shop` / `game_over`），所有名称为英文。
+每个命令返回一个 JSON decision point（`map_select` / `combat_play` / `card_reward` / `treasure` / `rest_site` / `event_choice` / `shop` / `game_over`），所有名称为英文。
 
 ## 游戏日志
 

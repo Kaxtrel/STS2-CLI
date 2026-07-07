@@ -15,6 +15,7 @@ import sys
 import os
 import argparse
 import random
+import threading
 from game_log import GameLogger
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -32,7 +33,14 @@ def _find_dotnet():
     ]
     for p in candidates:
         try:
-            r = subprocess.run([p, "--version"], capture_output=True, text=True, timeout=5)
+            r = subprocess.run(
+                [p, "--version"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+            )
             if r.returncode == 0:
                 return p
         except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -40,6 +48,26 @@ def _find_dotnet():
     return None
 
 DOTNET = _find_dotnet()
+
+
+def _simulator_popen_kwargs():
+    """Platform-specific Popen flags for the headless simulator."""
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {}
+
+
+def _drain_simulator_stderr(proc):
+    """Drain simulator stderr so the child process cannot block on a full pipe."""
+    def _drain():
+        try:
+            for line in proc.stderr:
+                if os.environ.get("STS2_SHOW_STDERR"):
+                    sys.stderr.write(line)
+        except Exception:
+            pass
+
+    threading.Thread(target=_drain, daemon=True).start()
 
 
 def _is_wsl():
@@ -133,8 +161,74 @@ def _build():
     """Build the C# project."""
     if not DOTNET:
         return False
-    r = subprocess.run([DOTNET, "build", PROJECT], capture_output=True, text=True, timeout=60)
+    r = subprocess.run(
+        [DOTNET, "build", PROJECT],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    if r.returncode != 0:
+        output = (r.stdout or "") + (r.stderr or "")
+        if output:
+            print(output[-4000:])
     return r.returncode == 0
+
+
+def _running_headless_processes(exe_path):
+    """Return running Sts2Headless processes that can lock the build output."""
+    if os.name != "nt":
+        return []
+    try:
+        r = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                (
+                    "Get-Process Sts2Headless -ErrorAction SilentlyContinue | "
+                    "Select-Object Id,Path | ConvertTo-Json -Compress"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+    except Exception:
+        return []
+    if r.returncode != 0 or not r.stdout.strip():
+        return []
+    try:
+        import json
+        data = json.loads(r.stdout)
+    except Exception:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    target = os.path.normcase(os.path.abspath(exe_path))
+    out = []
+    for proc in data:
+        path = proc.get("Path")
+        if path and os.path.normcase(os.path.abspath(path)) == target:
+            out.append({"pid": proc.get("Id"), "path": path})
+    return out
+
+
+def _latest_source_mtime():
+    """Latest timestamp of C# source/project files that should trigger a rebuild."""
+    latest = 0
+    for base in (
+        os.path.join(ROOT, "src", "Sts2Headless"),
+        os.path.join(ROOT, "src", "GodotStubs"),
+    ):
+        for root_d, _, files in os.walk(base):
+            for name in files:
+                if name.endswith((".cs", ".csproj")):
+                    latest = max(latest, os.path.getmtime(os.path.join(root_d, name)))
+    return latest
 
 
 def ensure_setup():
@@ -170,7 +264,15 @@ def ensure_setup():
     # Check if built
     exe_dir = os.path.join(ROOT, "src", "Sts2Headless", "bin", "Debug", "net9.0")
     exe = os.path.join(exe_dir, "Sts2Headless.dll")
-    if not os.path.isfile(exe) or os.path.getmtime(sts2_dll) > os.path.getmtime(exe):
+    exe_host = os.path.join(exe_dir, "Sts2Headless.exe")
+    exe_mtime = os.path.getmtime(exe) if os.path.isfile(exe) else 0
+    if exe_mtime == 0 or max(os.path.getmtime(sts2_dll), _latest_source_mtime()) > exe_mtime:
+        blockers = _running_headless_processes(exe_host)
+        if blockers:
+            pids = ", ".join(str(p["pid"]) for p in blockers if p.get("pid"))
+            print(f"⚠️  Sts2Headless is still running and locks the build output: PID {pids}")
+            print(f"   Stop it, then run again: Stop-Process -Id {pids}")
+            sys.exit(1)
         print("🏗️  Building...")
         if not _build():
             print("❌ Build failed. Try: ./setup.sh")
@@ -319,12 +421,17 @@ def short_n(obj):
     """Short name only."""
     return str(obj) if obj is not None else "?"
 
-def desc(obj):
+def desc(obj, upgraded=False, in_combat=False, vars_dict=None):
     """Extract description, strip BBCode tags, clean SmartFormat vars."""
     if obj and isinstance(obj, str):
         import re
         text = obj
         text = re.sub(r'\[/?[^\]]+\]', '', text)  # strip BBCode [tags]
+        lower_vars = {str(k).lower(): v for k, v in (vars_dict or {}).items()}
+
+        def has_var_value(name):
+            val = lower_vars.get(name.lower())
+            return val is not None and val != "" and val != 0
 
         # Handle SmartFormat expressions:
         # {IfUpgraded:show:text1|text2} → text2 (non-upgraded default)
@@ -333,20 +440,28 @@ def desc(obj):
         # {Stars:starIcons()} → [S] (star symbol)
         # {VarName:diff()} → [VarName] (simple var)
         # {VarName:choose(a|b)} → [VarName]
+        empty_braces = "\x00EMPTY_BRACES\x00"
+        text = text.replace("{}", empty_braces)
 
         def smart_replace(m):
             full = m.group(1)
             # Handle conditional: {IfUpgraded:show:textA|textB}
             if full.startswith("IfUpgraded:show:"):
                 parts = full[len("IfUpgraded:show:"):].split("|")
-                return parts[1] if len(parts) > 1 else parts[0]  # show non-upgraded
+                if upgraded:
+                    return parts[0]
+                return parts[1] if len(parts) > 1 else ""
             if full.startswith("IfUpgraded:"):
                 parts = full[len("IfUpgraded:"):].split("|")
-                return parts[1] if len(parts) > 1 else parts[0]
+                if upgraded:
+                    return parts[0]
+                return parts[1] if len(parts) > 1 else ""
             # {InCombat:text|alt} → show combat text
             if full.startswith("InCombat:"):
                 parts = full[len("InCombat:"):].split("|")
-                return parts[0].lstrip("\n")  # show combat version
+                if in_combat:
+                    return parts[0].lstrip("\n")
+                return parts[1] if len(parts) > 1 else ""
             # Energy icons: {Energy:energyIcons()} → [Energy]能量
             if "energyIcons" in full:
                 var = full.split(":")[0]
@@ -361,6 +476,17 @@ def desc(obj):
                 var = parts[0]
                 plural_parts = ":".join(parts[2:]).split("|")
                 return f"[{var}:{plural_parts[0]}|{plural_parts[1] if len(plural_parts) > 1 else plural_parts[0]}]"
+            # Conditional formatter: {Var.StringValue:cond:true text|false text}.
+            # At display time many object-valued vars are unavailable; prefer the
+            # explicit fallback instead of leaking SmartFormat syntax.
+            if ":cond:" in full:
+                var_expr, cond_body = full.split(":cond:", 1)
+                var_name = var_expr.split(".", 1)[0]
+                cond_body = cond_body.replace(empty_braces, "{}")
+                cond_parts = cond_body.split("|", 1)
+                if has_var_value(var_name):
+                    return cond_parts[0].replace("{}", f"[{var_name}]")
+                return cond_parts[1] if len(cond_parts) > 1 else ""
             # Conditional: {IsMultiplayer:textA|textB} → textB (single player)
             if ":" in full and "|" in full:
                 parts_after = ":".join(full.split(":")[1:]).split("|")
@@ -372,7 +498,7 @@ def desc(obj):
         # Process from innermost braces outward (handle nesting)
         for _ in range(3):  # max 3 nesting levels
             text = re.sub(r'\{([^{}]+)\}', smart_replace, text)
-        return text.strip()
+        return text.replace(empty_braces, "{}").strip()
     return ""
 
 COLORS = {
@@ -445,7 +571,15 @@ SPECIAL_VARS = {
     "energy": "能量",
 }
 
-def resolve_template(text, vars_dict):
+CALCULATED_VAR_FALLBACKS = {
+    "calculateddamage": ("damage", "ostydamage"),
+    "calculatedblock": ("block",),
+    "calculatedcards": ("cards",),
+    "calculatedforge": ("forge",),
+    "calculatedhits": ("repeat",),
+}
+
+def resolve_template(text, vars_dict, in_combat=False):
     """Replace [VarName] in text with actual values from vars dict.
     Matches case-insensitively against the vars dict keys.
     Also handles special vars like energyPrefix."""
@@ -468,6 +602,12 @@ def resolve_template(text, vars_dict):
             return f"[{key}]"
         kl = key.lower()
         val = lower_vars.get(kl)
+        if not in_combat and (val is None or val == 0):
+            for fallback_key in CALCULATED_VAR_FALLBACKS.get(kl, ()):
+                fallback_val = lower_vars.get(fallback_key)
+                if fallback_val is not None:
+                    val = fallback_val
+                    break
         if val is not None:
             return str(val)
         # Special vars
@@ -476,11 +616,11 @@ def resolve_template(text, vars_dict):
         return f"[{key}]"
     return re.sub(r'\[([^\]]+)\]', replacer, text)
 
-def card_desc(card):
+def card_desc(card, upgraded=False, in_combat=False):
     """Get resolved card description using stats as template vars."""
-    d = desc(card.get("description", {}))
+    d = desc(card.get("description", {}), upgraded=upgraded, in_combat=in_combat)
     stats = card.get("stats") or {}
-    return resolve_template(d, stats)  # always resolve (handles energyPrefix etc.)
+    return resolve_template(d, stats, in_combat=in_combat)  # always resolve (handles energyPrefix etc.)
 
 
 def _card_kw_label(kw):
@@ -524,9 +664,9 @@ def format_card_prefix_tag(prefix_list):
     return "[" + "/".join(_card_kw_label(k) for k in prefix_list) + "]"
 
 
-def card_description_display_lines(card):
+def card_description_display_lines(card, in_combat=False):
     """Lines under the title row; [前缀词条] merges into first line, then remaining loc lines."""
-    cd_d = card_desc(card)
+    cd_d = card_desc(card, in_combat=in_combat)
     prefix, _suf = split_card_keywords(card.get("keywords"))
     tag = format_card_prefix_tag(prefix)
     if not cd_d:
@@ -598,9 +738,9 @@ def relic_str(r):
     """Format a relic with name and resolved description."""
     if isinstance(r, dict) and "name" in r:
         name = n(r["name"])
-        d = desc(r.get("description", {}))
         # Resolve template vars with actual values
         vars_dict = r.get("vars") or {}
+        d = desc(r.get("description", {}), vars_dict=vars_dict)
         d = resolve_template(d, vars_dict)
         return f"{name}" + (f": {c(d, 'dim')}" if d else "")
     return n(r)
@@ -609,14 +749,26 @@ def potion_str(p):
     """Format a potion with name and resolved description."""
     if isinstance(p, dict) and "name" in p:
         name = n(p["name"])
-        d = desc(p.get("description", {}))
         vars_dict = p.get("vars") or {}
+        d = desc(p.get("description", {}), vars_dict=vars_dict)
         d = resolve_template(d, vars_dict) if vars_dict else d
         idx = p.get("index", "?")
         return f"[{idx}] {name}" + (f": {c(d, 'dim')}" if d else "")
     return n(p)
 
-def show_player(p, show_deck=False):
+def show_player_inventory(p):
+    """Show relics and potions. Returns True if anything was printed."""
+    printed = False
+    for r in p.get("relics", []):
+        print(f"    🔶 {relic_str(r)}")
+        printed = True
+    for pot in p.get("potions", []):
+        if pot:
+            print(f"    🧪 {potion_str(pot)}")
+            printed = True
+    return printed
+
+def show_player(p, show_deck=False, show_inventory=True):
     hp, mhp = p.get("hp", 0), p.get("max_hp", 1)
     blk = p.get("block", 0)
     gold = p.get("gold", 0)
@@ -626,11 +778,8 @@ def show_player(p, show_deck=False):
     print(f"  {c(name, 'bold')}  HP {bar(hp, mhp)} {c(f'{hp}/{mhp}', 'red')}"
           + (f"  {c(str(blk), 'blue')} {t('blk','挡')}" if blk > 0 else "")
           + f"  {t('Gold','金')} {c(str(gold), 'yellow')}  {t('Deck','牌组')} {deck}")
-    for r in p.get("relics", []):
-        print(f"    🔶 {relic_str(r)}")
-    for pot in p.get("potions", []):
-        if pot:
-            print(f"    🧪 {potion_str(pot)}")
+    if show_inventory:
+        show_player_inventory(p)
     if show_deck:
         cards = p.get("deck", [])
         if cards:
@@ -645,16 +794,8 @@ def show_player(p, show_deck=False):
                 print(f"    {n(cd['name'])}{up} ({cd.get('cost','?')}) {c(t(cd.get('type',''), ctype_zh), 'dim')}{rare_part}{suf_part}")
                 print_card_detail_extension(cd, indent="      ")
 
-def show_combat(state):
-    rnd = state.get("round", 0)
-    energy = state.get("energy", 0)
-    max_energy = state.get("max_energy", 0)
-    draw = state.get("draw_pile_count", 0)
-    discard = state.get("discard_pile_count", 0)
-
-    print(f"\n{'─' * 60}")
-    print(f"  {c(t(f'Round {rnd}',f'回合 {rnd}'), 'bold')}  {t('Energy','能量')} {c(f'{energy}/{max_energy}', 'cyan')}  {t('Draw','抽牌')} {draw}  {t('Discard','弃牌')} {discard}")
-    show_player(state.get("player", {}))
+def show_combat_player_status(state):
+    show_player(state.get("player", {}), show_inventory=False)
 
     # Player powers/buffs/debuffs
     ppowers = state.get("player_powers") or []
@@ -701,6 +842,21 @@ def show_combat(state):
     if stars is not None:
         print(f"    ⭐ {t('Stars','星辰')}: {c(str(stars), 'yellow')}")
 
+
+def show_combat_round_status(state):
+    rnd = state.get("round", 0)
+    energy = state.get("energy", 0)
+    max_energy = state.get("max_energy", 0)
+    draw = state.get("draw_pile_count", 0)
+    discard = state.get("discard_pile_count", 0)
+    print(f"  {c(t(f'Round {rnd}',f'回合 {rnd}'), 'bold')}  {t('Energy','能量')} {c(f'{energy}/{max_energy}', 'cyan')}  {t('Draw','抽牌')} {draw}  {t('Discard','弃牌')} {discard}")
+
+
+def show_combat(state):
+    print(f"\n{'─' * 60}")
+
+    p = state.get("player", {})
+    show_player_inventory(p)
     print()
     for e in state.get("enemies", []):
         hp, mhp = e.get("hp", 0), e.get("max_hp", 1)
@@ -716,34 +872,34 @@ def show_combat(state):
             if itype == "Attack":
                 if dmg is not None:
                     if hits and hits > 1:
-                        intent_parts.append(c(f"⚔{dmg}x{hits}", "red"))
+                        intent_parts.append(c(f"⚔ {dmg}x{hits}", "red"))
                     else:
-                        intent_parts.append(c(f"⚔{dmg}", "red"))
+                        intent_parts.append(c(f"⚔ {dmg}", "red"))
                 else:
-                    intent_parts.append(c(t("⚔ATK","⚔攻击"), "red"))
+                    intent_parts.append(c(t("⚔ ATK","⚔ 攻击"), "red"))
             elif itype == "Defend":
-                intent_parts.append(c(t("🛡DEF","🛡防御"), "blue"))
+                intent_parts.append(c(t("🛡 DEF","🛡 防御"), "blue"))
             elif itype in ("Buff", "Heal"):
-                intent_parts.append(c(t(f"⬆{itype}",f"⬆{'增益' if itype=='Buff' else '回复'}"), "magenta"))
+                intent_parts.append(c(t(f"⬆ {itype}",f"⬆ {'增益' if itype=='Buff' else '回复'}"), "magenta"))
             elif itype == "Debuff":
-                intent_parts.append(c(t("⬇Debuff","⬇减益"), "yellow"))
+                intent_parts.append(c(t("⬇ Debuff","⬇ 减益"), "yellow"))
             elif itype == "DebuffStrong":
-                intent_parts.append(c(t("⬇Strong","⬇强减益"), "yellow"))
+                intent_parts.append(c(t("⬇ Strong","⬇ 强减益"), "yellow"))
             elif itype in ("CardDebuff", "StatusCard"):
-                intent_parts.append(c(t("⬇Cards","⬇塞牌"), "yellow"))
+                intent_parts.append(c(t("⬇ Cards","⬇ 塞牌"), "yellow"))
             elif itype == "DeathBlow":
                 if dmg is not None:
-                    intent_parts.append(c(f"💀{dmg}", "red"))
+                    intent_parts.append(c(f"💀 {dmg}", "red"))
                 else:
-                    intent_parts.append(c(t("💀KILL","💀致命一击"), "red"))
+                    intent_parts.append(c(t("💀 KILL","💀 致命一击"), "red"))
             elif itype == "Escape":
-                intent_parts.append(c(t("🏃Escape","🏃逃跑"), "dim"))
+                intent_parts.append(c(t("🏃 Escape","🏃 逃跑"), "dim"))
             elif itype == "Summon":
-                intent_parts.append(c(t("📢Summon","📢召唤"), "magenta"))
+                intent_parts.append(c(t("📢 Summon","📢 召唤"), "magenta"))
             elif itype == "Sleep":
-                intent_parts.append(c(t("💤Sleep","💤休眠"), "dim"))
+                intent_parts.append(c(t("💤 Sleep","💤 休眠"), "dim"))
             elif itype == "Stun":
-                intent_parts.append(c(t("⚡Stun","⚡眩晕"), "yellow"))
+                intent_parts.append(c(t("⚡ Stun","⚡ 眩晕"), "yellow"))
             elif itype == "Hidden":
                 intent_parts.append(c("? ???", "dim"))
             elif itype:
@@ -762,6 +918,10 @@ def show_combat(state):
               + f"  {intent_str}{power_str}")
 
     print()
+    show_combat_player_status(state)
+    show_combat_round_status(state)
+    print()
+
     hand = state.get("hand", [])
     for card in hand:
         cost = card.get("cost", 0)
@@ -789,7 +949,7 @@ def show_combat(state):
         print(f"  {mark} [{card['index']}] {c(n(card['name']), type_color)}{ench_str} ({cost_str}) {stat_str}{suf_part}"
               + (f"  {c('→','yellow')}" if target == "AnyEnemy" else ""))
 
-        print_card_detail_extension(card, indent="      ")
+        print_card_detail_extension(card, indent="      ", in_combat=True)
 
 def show_map(state, send_fn=None):
     """Show map at map_select. Fetches full map if send_fn available."""
@@ -823,7 +983,7 @@ def show_map(state, send_fn=None):
         ntype = t(ch["type"], NODE_TYPE_ZH.get(ch["type"], ch["type"]))
         print(f"  [{i}] {icon} {ntype}")
 
-def _format_upgrade_preview(stats, aug, current_cost=None):
+def _format_upgrade_preview(stats, aug, current_cost=None, current_description=None, in_combat=False):
     """Format upgrade preview string."""
     if not aug:
         return None
@@ -850,18 +1010,38 @@ def _format_upgrade_preview(stats, aug, current_cost=None):
         parts.append(c(f"-{_card_kw_label(kw)}", "green"))
     for kw in (aug.get("added_keywords") or []):
         parts.append(c(f"+{_card_kw_label(kw)}", "yellow"))
+    if not parts:
+        aug_card = {
+            "description": aug.get("description"),
+            "stats": aug_stats,
+            "keywords": aug.get("keywords"),
+        }
+        aug_desc = card_desc(aug_card, upgraded=True, in_combat=in_combat)
+        if current_description and aug_desc and aug_desc != current_description:
+            parts.append(c(aug_desc, "green"))
     return parts
 
 
-def print_card_detail_extension(card, indent="      "):
+def print_card_detail_extension(card, indent="      ", in_combat=False):
     """Description (with [prefix/keywords]) + upgrade preview; indent matches title row spacing."""
-    for line in card_description_display_lines(card):
+    for line in card_description_display_lines(card, in_combat=in_combat):
         if line:
             print(f"{indent}{c(line, 'dim')}")
     stats = card.get("stats") or {}
-    aug_parts = _format_upgrade_preview(stats, card.get("after_upgrade"), card.get("cost"))
+    current_description = card_desc(card, in_combat=in_combat)
+    aug_parts = _format_upgrade_preview(
+        stats,
+        card.get("after_upgrade"),
+        card.get("card_cost", card.get("cost")),
+        current_description,
+        in_combat,
+    )
     if aug_parts:
-        print(f"{indent}{c(t('upgrade:','升级:'), 'green')} {', '.join(aug_parts)}")
+        aug_text = ", ".join(aug_parts)
+        aug_lines = aug_text.splitlines()
+        print(f"{indent}{c(t('upgrade:','升级:'), 'green')} {aug_lines[0]}")
+        for line in aug_lines[1:]:
+            print(f"{indent}{line}")
 
 
 def card_pick_quantity_hint(mn, mx):
@@ -904,6 +1084,22 @@ def show_card_reward(state):
     else:
         print(f"  {c(t('No cards to pick.', '没有可选卡牌。'), 'dim')}")
 
+def show_treasure(state):
+    print(f"\n{'─' * 60}")
+    ctx = state.get("context", {})
+    if ctx:
+        print(f"  {c(n(ctx.get('act_name','?')), 'dim')} {t('Floor','层')} {ctx.get('floor','?')}")
+    print(f"  {c(t('Treasure','宝箱'), 'bold')}")
+
+    rewards = state.get("rewards", [])
+    if not rewards:
+        print(f"    {c(t('No rewards.', '没有获得奖励。'), 'dim')}")
+        return
+
+    print(f"  {c(t('Rewards:','获得:'), 'yellow')}")
+    for reward in rewards:
+        print(f"    🔶 {relic_str(reward)}")
+
 def show_shop(state):
     print(f"\n{'─' * 60}")
     print(f"  {c(t('Shop','商店'), 'bold')}")
@@ -928,7 +1124,8 @@ def show_shop(state):
         if not r.get("is_stocked"): continue
         cost = r.get("cost", 0)
         affordable = c(str(cost), "green") if cost <= gold else c(str(cost), "red")
-        r_desc = desc(r.get("description", ""))
+        r_vars = r.get("vars") or {}
+        r_desc = resolve_template(desc(r.get("description", ""), vars_dict=r_vars), r_vars)
         print(f"  [r{r['index']}] {n(r['name'])} — {affordable}{t('g','金')}")
         if r_desc:
             print(f"      {c(r_desc, 'dim')}")
@@ -938,7 +1135,8 @@ def show_shop(state):
         if not p.get("is_stocked"): continue
         cost = p.get("cost", 0)
         affordable = c(str(cost), "green") if cost <= gold else c(str(cost), "red")
-        p_desc = desc(p.get("description", ""))
+        p_vars = p.get("vars") or {}
+        p_desc = resolve_template(desc(p.get("description", ""), vars_dict=p_vars), p_vars)
         print(f"  [p{p['index']}] {n(p['name'])} — {affordable}{t('g','金')}")
         if p_desc:
             print(f"      {c(p_desc, 'dim')}")
@@ -1045,9 +1243,9 @@ def show_event(state):
             title = loc_resolve(raw_title) if '.' in str(raw_title) or str(raw_title).isupper() else raw_title
         # Show option description with resolved template vars
         raw_desc = opt.get("description")
-        opt_desc = desc(raw_desc) if raw_desc else ""
         # Resolve template vars like [MaxHp], [Gold], {Cards}
         opt_vars = opt.get("vars") or {}
+        opt_desc = desc(raw_desc, vars_dict=opt_vars) if raw_desc else ""
         if opt_vars and opt_desc:
             opt_desc = resolve_template(opt_desc, opt_vars)
         desc_str = f" — {c(opt_desc, 'dim')}" if opt_desc else ""
@@ -1092,10 +1290,14 @@ def _render_map(map_data, choice_set=None, choice_indices=None):
             for ch in (nd.get("children") or []):
                 edges_up.setdefault(rn, []).append((col, ch["col"]))
 
-    row_numbers = sorted(row_numbers)
-    total_cols = max_col + 1
     W = 4  # chars per column cell
     # Center of column c = c*W + W//2 = c*4 + 2
+    boss = map_data.get("boss", {})
+    boss_col = boss.get("col", 0)
+    boss_row = boss.get("row", -1)
+    max_col = max(max_col, boss_col)
+    row_numbers = sorted(row_numbers)
+    total_cols = max_col + 1
 
     width = W * total_cols + 6
     print(f"\n{'═' * width}")
@@ -1106,14 +1308,24 @@ def _render_map(map_data, choice_set=None, choice_indices=None):
     print()
 
     # Boss row
-    boss = map_data.get("boss", {})
-    boss_col = boss.get("col", 0)
-    boss_row = boss.get("row", -1)
+    boss_choice_idx = choice_indices.get((boss_col, boss_row))
     buf = list(" " * (W * total_cols))
-    buf[boss_col * W + W // 2] = "B"
+    boss_center = boss_col * W + W // 2
+    buf[boss_center] = "B"
     line = "".join(buf)
-    line = line[:boss_col * W + W // 2] + c("B", "red") + line[boss_col * W + W // 2 + 1:]
+    boss_color = "yellow" if boss_choice_idx is not None else "red"
+    line = line[:boss_center] + c("B", boss_color) + line[boss_center + 1:]
     print(f"  {c('B','dim')} | {line}")
+    if boss_choice_idx is not None:
+        ann = list(" " * (W * total_cols))
+        label = f"[{boss_choice_idx}]"
+        start = boss_center - 1
+        for j, ch in enumerate(label):
+            if 0 <= start + j < len(ann):
+                ann[start + j] = ch
+        ann_line = "".join(ann)
+        ann_line = ann_line[:start] + c(label, "yellow") + ann_line[start + len(label):]
+        print(f"    | {ann_line}")
 
     # Connection from top row to boss
     top_rn = row_numbers[-1] if row_numbers else -1
@@ -1123,13 +1335,12 @@ def _render_map(map_data, choice_set=None, choice_indices=None):
             pass
     # Actually, edges_up[top_rn] has edges from top_rn to its children.
     # Children of top row nodes go to boss.
-    for nd_row in rows:
-        for nd in nd_row:
-            if nd.get("row") == top_rn:
-                for ch in (nd.get("children") or []):
-                    if ch.get("row") == boss_row:
-                        fc, tc = nd["col"], ch["col"]
-                        _draw_conn(conn, fc, tc, W)
+    for nd in node_map.values():
+        if nd.get("row") == top_rn:
+            for ch in (nd.get("children") or []):
+                if ch.get("row") == boss_row:
+                    fc, tc = nd["col"], ch["col"]
+                    _draw_conn(conn, fc, tc, W)
     print(f"    | {c(''.join(conn), 'dim')}")
 
     # Map rows (top to bottom)
@@ -1196,13 +1407,12 @@ def _render_map(map_data, choice_set=None, choice_indices=None):
                 # We need edges where child row == rn
                 pass
             # Rebuild: iterate edges from below_rn whose children are in rn
-            for nd_row in rows:
-                for nd in nd_row:
-                    if nd.get("row") != below_rn:
-                        continue
-                    for ch in (nd.get("children") or []):
-                        if ch.get("row") == rn:
-                            _draw_conn(conn, nd["col"], ch["col"], W)
+            for nd in node_map.values():
+                if nd.get("row") != below_rn:
+                    continue
+                for ch in (nd.get("children") or []):
+                    if ch.get("row") == rn:
+                        _draw_conn(conn, nd["col"], ch["col"], W)
             print(f"    | {c(''.join(conn), 'dim')}")
 
     # Legend
@@ -1218,6 +1428,8 @@ def _render_map(map_data, choice_set=None, choice_indices=None):
         for i in sorted(inv.keys()):
             col, row = inv[i]
             nd = node_map.get((col, row))
+            if nd is None and col == boss_col and row == boss_row:
+                nd = boss
             if nd:
                 ntype = t(nd.get("type", "?"), NODE_TYPE_ZH.get(nd.get("type", ""), nd.get("type", "?")))
                 parts.append(f"{c(str(i), 'yellow')}={ntype}")
@@ -1249,7 +1461,9 @@ def get_input(prompt, valid_options=None, state=None, multi_select=False, multi_
     while True:
         try:
             raw = input(f"\n{c('>', 'green')} {prompt}: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
+            raise _QuitRequested()
+        except KeyboardInterrupt:
             raise _QuitRequested()
 
         if not raw:
@@ -1267,12 +1481,14 @@ def get_input(prompt, valid_options=None, state=None, multi_select=False, multi_
     {c('relics', 'cyan')}   — 查看遗物
     {c('quit', 'cyan')}     — 退出
     {c('save', 'cyan')}     — 存档
+    {c('sl', 'cyan')}       — 重读当前存档
     {c('saves', 'cyan')}    — 查看存档列表
 
   {c('操作:', 'bold')}
     地图:    输入路径编号 (0, 1, 2)
-    战斗:    卡牌编号 / {c('e', 'yellow')} 结束回合 / {c('p0', 'yellow')} 使用药水
+    战斗:    卡牌编号或 {c('0,1', 'yellow')} 连续出牌 / {c('e', 'yellow')} 结束回合 / {c('p0', 'yellow')} 使用药水
     奖励:    卡牌编号 / {c('s', 'yellow')} 跳过
+    宝箱:    {c('leave', 'yellow')} 继续
     多选:    按提示选择张数（须选 N–M 张 / 可选 0–M 张等），编号逗号分隔，例如 {c('0,1,2', 'yellow')}
     休息:    选项编号
     事件:    选项编号 / {c('leave', 'yellow')} 离开
@@ -1289,12 +1505,14 @@ def get_input(prompt, valid_options=None, state=None, multi_select=False, multi_
     {c('quit', 'cyan')}     — quit
     {c('abandon', 'cyan')}  — abandon run (forfeit)
     {c('save', 'cyan')}     — save game
+    {c('sl', 'cyan')}       — reload current save
     {c('saves', 'cyan')}    — list saves
 
   {c('Actions:', 'bold')}
     Map:     path number (0, 1, 2)
-    Combat:  card index / {c('e', 'yellow')} end turn / {c('p0', 'yellow')} use potion
+    Combat:  card index or {c('0,1', 'yellow')} sequence / {c('e', 'yellow')} end turn / {c('p0', 'yellow')} use potion
     Reward:  card index / {c('s', 'yellow')} skip
+    Treasure:{c('leave', 'yellow')} continue
     Multi:   when prompted for N–M cards (or 0–M optional), comma-separate indices, e.g. {c('0,1,2', 'yellow')}
     Rest:    option index
     Event:   option index / {c('leave', 'yellow')} leave
@@ -1337,13 +1555,21 @@ def get_input(prompt, valid_options=None, state=None, multi_select=False, multi_
             else:
                 print(f"  {t('Save not available.','存档不可用。')}")
             continue
+        if raw == "sl":
+            reload_path = getattr(get_input, "_reload_path", None)
+            if reload_path and os.path.isfile(reload_path):
+                get_input._reload_available = True
+                raise _ReloadRequested()
+            print(f"  {t('No native save is available to reload.', '当前没有可重读的原生存档。')}")
+            continue
         if raw == "saves":
             saves = _list_saves()
             if saves:
                 print(f"\n  {c(t('Saved games:','存档列表:'), 'bold')}")
                 for s in saves:
-                    print(f"    {c(s['file'], 'cyan')}  {s['character']}  {t('Seed','种子')}:{s['seed']}  {t('Actions','操作数')}:{s['actions']}")
-                print(f"\n  {t('Load with:','读档命令:')} python3 play.py --load saves/{saves[0]['file']}")
+                    print(f"    {c(s['file'], 'cyan')}  [{t('native save','原生存档')}]")
+                first = saves[0]
+                print(f"\n  {t('Load with:','读档命令:')} python3 play.py --continue saves/{first['file']}")
             else:
                 print(f"  {t('No saves found.','没有找到存档。')}")
             continue
@@ -1380,60 +1606,177 @@ def get_input(prompt, valid_options=None, state=None, multi_select=False, multi_
                 continue
         return raw
 
+
+_COMBAT_BACK = object()
+
+
+def _combat_cards_by_index(state):
+    return {
+        str(card["index"]): card
+        for card in state.get("hand", [])
+        if card.get("index") is not None
+    }
+
+
+def _combat_playable_cards(state):
+    energy = state.get("energy", 0)
+    return {
+        key: card
+        for key, card in _combat_cards_by_index(state).items()
+        if card.get("can_play") and card.get("cost", 99) <= energy
+    }
+
+
+def _combat_action_options(state):
+    options = {"e": "end_turn"}
+    options.update(_combat_cards_by_index(state))
+    for potion in state.get("player", {}).get("potions", []):
+        if potion and potion.get("index") is not None:
+            options[f"p{potion['index']}"] = potion
+    return options
+
+
+def _parse_combat_card_sequence(raw, cards_by_index):
+    import re
+    tokens = [p for p in re.split(r"[,\s]+", raw.strip()) if p]
+    if not tokens or any(not p.isdigit() or p not in cards_by_index for p in tokens):
+        return None
+    return [dict(cards_by_index[p]) for p in tokens]
+
+
+def _combat_card_label(card):
+    return f"[{card.get('index', '?')}] {n(card.get('name', '?'))}"
+
+
+def _find_planned_card(state, planned):
+    hand = state.get("hand", [])
+    instance_id = planned.get("instance_id")
+    if instance_id is not None:
+        card = next((c for c in hand if c.get("instance_id") == instance_id), None)
+        if card is not None:
+            return card
+
+    original_index = planned.get("index")
+    original_id = planned.get("id")
+    return next(
+        (c for c in hand if c.get("index") == original_index and c.get("id") == original_id),
+        None,
+    )
+
+
+def _is_combat_card_playable(state, card):
+    return card.get("can_play") and card.get("cost", 99) <= state.get("energy", 0)
+
+
+def _choose_enemy_target(state, auto=False):
+    enemies = state.get("enemies", [])
+    if len(enemies) == 1:
+        return enemies[0]["index"]
+    if auto and enemies:
+        return min(enemies, key=lambda e: e.get("hp", 999))["index"]
+    if not enemies:
+        return None
+
+    target_options = {str(e["index"]) for e in enemies} | {"b", "back"}
+    tgt = get_input(
+        t("Target enemy [index] or (b)ack", "选择敌人 [编号] 或 (b)返回"),
+        target_options,
+        state=state,
+    )
+    if tgt in ("b", "back"):
+        return _COMBAT_BACK
+    return int(tgt)
+
+
+def _target_args_for(meta, state, auto=False):
+    if meta.get("target_type") != "AnyEnemy":
+        return {}
+    target = _choose_enemy_target(state, auto=auto)
+    if target is _COMBAT_BACK:
+        return None
+    return {"target_index": target} if target is not None else {}
+
+
+def _play_one_combat_card(state, card, send, auto=False):
+    if not _is_combat_card_playable(state, card):
+        print(f"  {c(t('Cannot play:', '无法打出:'), 'yellow')} {_combat_card_label(card)}")
+        return state
+
+    args = {"card_index": card["index"]}
+    target_args = _target_args_for(card, state, auto=auto)
+    if target_args is None:
+        return state
+    args.update(target_args)
+    return send({"cmd": "action", "action": "play_card", "args": args})
+
+
+def _play_combat_card_sequence(state, planned_cards, send, auto=False):
+    is_sequence = len(planned_cards) > 1
+    for planned in planned_cards:
+        if not state or state.get("decision") != "combat_play":
+            break
+
+        card = _find_planned_card(state, planned)
+        if card is None:
+            if is_sequence:
+                print(f"  {c(t('Stopped:', '已停止:'), 'yellow')} "
+                      f"{_combat_card_label(planned)} {t('is no longer in hand.', '已不在手牌中。')}")
+            break
+
+        next_state = _play_one_combat_card(state, card, send, auto=auto)
+        if next_state is state:
+            break
+        state = next_state
+    return state
+
+
+def _use_combat_potion(state, choice, send, auto=False):
+    pidx = int(choice[1:])
+    args = {"potion_index": pidx}
+    potions = state.get("player", {}).get("potions", [])
+    potion = next((p for p in potions if p and p.get("index") == pidx), None)
+    if potion:
+        target_args = _target_args_for(potion, state, auto=auto)
+        if target_args is None:
+            return state
+        args.update(target_args)
+    return send({"cmd": "action", "action": "use_potion", "args": args})
+
 # ─── Main game loop ───
 
-def _save_game(save_path, character, seed, action_log):
-    """Write action replay save file."""
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    data = {"character": character, "seed": seed, "actions": action_log}
-    with open(save_path, "w") as f:
-        json.dump(data, f, indent=2)
+def _save_name_part(value, default="run"):
+    """Return a filesystem-friendly save filename component."""
+    import re
+    text = str(value or default)
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("._")
+    return text or default
 
-def _load_game(save_path):
-    """Read action replay save file. Returns (character, seed, actions)."""
-    try:
-        with open(save_path) as f:
-            data = json.load(f)
-    except json.JSONDecodeError as e:
-        print(f"{t('Error:','错误:')} Save file is not valid JSON: {save_path}")
-        print(f"  {e}")
-        sys.exit(1)
-    if "actions" not in data:
-        print(f"{t('Error:','错误:')} Not a replay save file (missing 'actions' key): {save_path}")
-        sys.exit(1)
-    return data["character"], data["seed"], data["actions"]
+
+def _timestamped_save_path(character, seed, ext):
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    char_tag = _save_name_part(character)
+    seed_tag = _save_name_part(seed, "random")
+    return os.path.join(SAVE_DIR, f"{char_tag}_{seed_tag}_{ts}{ext}")
+
 
 def _list_saves():
-    """List available save files (replay .json and native .save files)."""
+    """List available native .save files."""
     if not os.path.isdir(SAVE_DIR):
         return []
     saves = []
     for f in sorted(os.listdir(SAVE_DIR)):
         path = os.path.join(SAVE_DIR, f)
-        if f.endswith(".json"):
-            # Only list .json files that are replay saves (have "actions" key)
-            try:
-                with open(path) as fh:
-                    d = json.load(fh)
-                if "actions" not in d:
-                    continue  # skip non-replay JSON files
-                saves.append({
-                    "file": f, "path": path, "type": "replay",
-                    "character": d.get("character", "?"),
-                    "seed": d.get("seed", "?"),
-                    "actions": len(d.get("actions", [])),
-                })
-            except Exception:
-                pass
-        elif f.endswith(".save"):
-            # Native save files
+        if f.endswith(".save"):
             saves.append({
                 "file": f, "path": path, "type": "native",
-                "character": "?", "seed": "?", "actions": "—",
             })
     return saves
 
 class _QuitRequested(Exception):
+    pass
+
+class _ReloadRequested(Exception):
     pass
 
 def _quit_with_save(native_save_path, character, seed):
@@ -1451,11 +1794,7 @@ def _quit_with_save(native_save_path, character, seed):
     if native_save_path:
         return native_save_path
 
-    from datetime import datetime
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    char_tag = (character or "run").lower()
-    seed_tag = seed or "random"
-    return os.path.join(SAVE_DIR, f"{char_tag}_{seed_tag}_{ts}.save")
+    return _timestamped_save_path(character, seed, ".save")
 
 
 def _show_quit_save_result(result):
@@ -1475,34 +1814,36 @@ def _show_quit_save_result(result):
 def _writeback_continue_save(send_fn, native_save_path):
     """Best-effort writeback for --continue sessions when a stable map checkpoint is reached."""
     if not native_save_path:
-        return
+        return False
     result = send_fn({"cmd": "write_continue_save", "path": native_save_path})
     if result and result.get("success"):
         sz = result.get("size", 0)
         print(f"  {c(t(f'Save written ({sz//1024}KB)', f'存档已写入 ({sz//1024}KB)'), 'dim')}")
+        return True
     elif result:
         print(f"  {c(t('Save failed:','存档写入失败:'), 'red')} {result.get('message','?')}")
+    return False
 
 
 def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
-         load_path=None, native_save_path=None):
+         native_save_path=None):
     actual_seed = seed or f"cli_{random.randint(1000,9999)}"
-    replay_actions = None
     restart_requested = False
+    reload_requested = False
     quit_sent = False
 
-    if load_path:
-        character, actual_seed, replay_actions = _load_game(load_path)
-        print(f"\n{c(t('Loading save...','读取存档...'), 'yellow')} {os.path.basename(load_path)}")
-        print(f"  {t('Character','角色')}: {character}  {t('Seed','种子')}: {actual_seed}  {t('Actions','操作数')}: {len(replay_actions)}")
+    load_native_save_path = native_save_path
+    if native_save_path is None:
+        native_save_path = _timestamped_save_path(character, actual_seed, ".save")
 
     logger = GameLogger(character, actual_seed, enabled=log)
-    action_log = []
     proc = subprocess.Popen(
         [DOTNET, "run", "--no-build", "--project", PROJECT],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True, bufsize=1,
+        stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1,
+        **_simulator_popen_kwargs(),
     )
+    _drain_simulator_stderr(proc)
 
     def read():
         while True:
@@ -1514,25 +1855,36 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
                 logger.log_state(resp)
                 return resp
 
-    def send(cmd, record=True):
+    def send(cmd):
         logger.log_action(cmd)
-        if record and cmd.get("cmd") == "action":
-            action_log.append(cmd)
         proc.stdin.write(json.dumps(cmd) + "\n")
         proc.stdin.flush()
         return read()
 
+    def try_send_quit(path=None):
+        quit_cmd = {"cmd": "quit"}
+        if path:
+            quit_cmd["path"] = path
+        try:
+            return send(quit_cmd)
+        except (BrokenPipeError, OSError, ValueError):
+            # Ctrl+C on Windows can also interrupt the child dotnet process, closing
+            # its stdin before Python gets to send the graceful quit command.
+            return None
+
     # Wire send into get_input for map command
     get_input._send = send
+    get_input._reload_path = native_save_path
+    get_input._reload_available = bool(native_save_path and os.path.isfile(native_save_path))
 
     def do_save():
-        from datetime import datetime
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname = f"{character}_{actual_seed}_{ts}.json"
-        save_path = os.path.join(SAVE_DIR, fname)
-        _save_game(save_path, character, actual_seed, action_log)
-        print(f"  {c(t('Saved!','已存档!'), 'green')} {fname} ({len(action_log)} {t('actions','步操作')})")
-        print(f"  {t('Load with:','读档命令:')} python3 play.py --load {os.path.relpath(save_path, ROOT)}")
+        if _writeback_continue_save(send, native_save_path):
+            get_input._reload_available = True
+            print(f"  {t('Save path:','存档位置:')} {c(native_save_path, 'cyan')}")
+            print(f"  {t('Continue later:','下次继续:')} python3 play.py --continue {native_save_path}")
+            return
+
+        print(f"  {c(t('Save failed; no save was written.','保存失败，未写入存档。'), 'red')}")
 
     get_input._save_fn = do_save
     try:
@@ -1542,12 +1894,9 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
             return
 
         game_lang = "en" if LANG == "en" else "zh"
-        if native_save_path:
+        if load_native_save_path:
             print(f"  {t('Loading game save...','加载游戏存档...')}")
-            state = send(
-                {"cmd": "load_save", "path": native_save_path, "lang": game_lang},
-                record=False,
-            )
+            state = send({"cmd": "load_save", "path": load_native_save_path, "lang": game_lang})
             if state and state.get("type") == "error":
                 print(f"  {c(t('Error:','错误:'), 'red')} {state.get('message', '?')}")
                 return
@@ -1564,25 +1913,13 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
                 "seed": actual_seed,
                 "ascension": ascension,
                 "lang": game_lang,
-            }, record=False)
+            })
             if state and state.get("type") == "error":
                 print(f"  {c(t('Error:','错误:'), 'red')} {state.get('message', '?')}")
                 return
 
-            # Replay saved actions silently
-            if replay_actions:
-                total = len(replay_actions)
-                for i, cmd in enumerate(replay_actions):
-                    state = send(cmd, record=True)
-                    pct = (i + 1) * 100 // total
-                    print(f"\r  {t('Replaying','回放中')}... {pct}% ({i+1}/{total})", end="", flush=True)
-                    if not state:
-                        print(f"\n{c(t('Replay failed at action','回放失败于操作'), 'red')} {i+1}")
-                        return
-                print(f"\r  {c(t('Replay complete!','回放完成!'), 'green')}" + " " * 30)
-                print()
         print(f"\n{c(t('Slay the Spire 2 — Headless CLI', '杀戮尖塔 2 — 终端版'), 'bold')}")
-        if native_save_path:
+        if load_native_save_path:
             p = state.get("player", {}) if state else {}
             ctx = state.get("context", {}) if state else {}
             print(f"{t('Character','角色')}: {n(p.get('name','?'))}  "
@@ -1603,7 +1940,10 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
                 break
 
             if state.get("type") == "error":
-                print(f"  {c(t('Error:','错误:'), 'red')} {state.get('message', '?')}")
+                message = state.get("message", "?")
+                print(f"  {c(t('Error:','错误:'), 'red')} {message}")
+                if "not active and has not finished" in str(message) or "End turn did not reach" in str(message):
+                    break
                 state = send({"cmd": "action", "action": "proceed"})
                 continue
 
@@ -1649,7 +1989,8 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
                 break
 
             elif dec == "map_select":
-                _writeback_continue_save(send, native_save_path)
+                if _writeback_continue_save(send, native_save_path):
+                    get_input._reload_available = True
                 show_map(state, send_fn=send)
                 choices = state.get("choices", [])
 
@@ -1674,21 +2015,11 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
             elif dec == "combat_play":
                 show_combat(state)
                 hand = state.get("hand", [])
-                enemies = state.get("enemies", [])
                 energy = state.get("energy", 0)
-
-                valid = {"e": "end_turn"}
-                for card in hand:
-                    if card.get("can_play") and card.get("cost", 99) <= energy:
-                        valid[str(card["index"])] = card
-                # Add potion shortcuts
-                for pot in state.get("player", {}).get("potions", []):
-                    if pot:
-                        valid[f"p{pot['index']}"] = f"potion_{pot['index']}"
 
                 if auto:
                     # Auto: play first playable card, or end turn
-                    playable = [c for c in hand if c.get("can_play") and c.get("cost", 99) <= energy]
+                    playable = list(_combat_playable_cards(state).values())
                     if playable:
                         card = playable[0]
                         choice = str(card["index"])
@@ -1707,52 +2038,35 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
                         _auto_last_fingerprint = fp
                         _auto_stuck_count = 0
                 else:
-                    choice = get_input(t("Play card [index], (e)nd turn, (p0) potion", "出牌 [编号], (e)结束回合, (p0)药水"), set(valid.keys()) | {"help"}, state=state)
-                    if choice == "help":
-                        print(f"  {t('Enter card index, e=end turn, p0=use potion 0', '输入卡牌编号，e=结束回合，p0=使用药水0')}")
-                        continue
+                    choice = get_input(
+                        t("Play card [index or 0,1], (e)nd turn, (p0) potion",
+                          "出牌 [编号或 0,1], (e)结束回合, (p0)药水"),
+                        state=state,
+                    )
 
                 if choice == "e":
-                    # Track hand before end_turn to detect added status cards
-                    old_hand_names = [n(cd.get("name","?")) for cd in hand]
-                    old_discard = state.get("discard_pile_count", 0)
                     state = send({"cmd": "action", "action": "end_turn"})
                     # Show status cards added (new cards in hand/discard that weren't there)
                     if state and state.get("decision") == "combat_play":
                         new_hand = state.get("hand", [])
-                        new_discard = state.get("discard_pile_count", 0)
                         status_cards = [n(cd.get("name","?")) for cd in new_hand if cd.get("type") in ("Status", "Curse")]
                         if status_cards:
-                            from collections import Counter
                             sc_str = ", ".join(f"{c(name, 'red')}" for name in status_cards)
                             print(f"  ⚠ {t('Status cards in hand:','手牌中的状态牌:')}: {sc_str}")
                 elif choice.startswith("p") and choice[1:].isdigit():
-                    # Use potion
-                    pidx = int(choice[1:])
-                    args = {"potion_index": pidx}
-                    pots = state.get("player", {}).get("potions", [])
-                    pot_meta = next((p for p in pots if p and p.get("index") == pidx), None)
-                    if pot_meta and pot_meta.get("target_type") == "AnyEnemy" and enemies:
-                        tgt = get_input(
-                            t("Target enemy [index]", "选择敌人 [编号]"),
-                            {str(e["index"]) for e in enemies},
-                            state=state,
-                        )
-                        args["target_index"] = int(tgt)
-                    state = send({"cmd": "action", "action": "use_potion", "args": args})
+                    options = _combat_action_options(state)
+                    if choice not in options:
+                        print(f"  {t('Invalid. Options:','无效。选项:')} {', '.join(sorted(options))}")
+                        continue
+                    state = _use_combat_potion(state, choice, send, auto=auto)
                 else:
-                    card = valid[choice]
-                    args = {"card_index": card["index"]}
-                    if card.get("target_type") == "AnyEnemy":
-                        if len(enemies) == 1:
-                            args["target_index"] = enemies[0]["index"]
-                        elif auto:
-                            args["target_index"] = min(enemies, key=lambda e: e.get("hp", 999))["index"]
-                        else:
-                            tgt = get_input("Target enemy [index]",
-                                           {str(e["index"]) for e in enemies})
-                            args["target_index"] = int(tgt)
-                    state = send({"cmd": "action", "action": "play_card", "args": args})
+                    cards_by_index = _combat_cards_by_index(state)
+                    planned_cards = _parse_combat_card_sequence(choice, cards_by_index)
+                    if planned_cards is None:
+                        options = _combat_action_options(state)
+                        print(f"  {t('Invalid. Options:','无效。选项:')} {', '.join(sorted(options))}")
+                        continue
+                    state = _play_combat_card_sequence(state, planned_cards, send, auto=auto)
 
             elif dec == "card_reward":
                 show_card_reward(state)
@@ -1774,6 +2088,15 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
                 else:
                     state = send({"cmd": "action", "action": "select_card_reward",
                                  "args": {"card_index": int(choice)}})
+
+            elif dec == "treasure":
+                show_treasure(state)
+                if auto:
+                    choice = "leave"
+                else:
+                    choice = get_input(t("Treasure claimed — (leave) to continue", "宝箱已领取 — 输入 (leave) 继续"), {"leave"}, state=state)
+                if choice == "leave":
+                    state = send({"cmd": "action", "action": "leave_room"})
 
             elif dec == "bundle_select":
                 print(f"\n{'─' * 60}")
@@ -1928,7 +2251,9 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
                 old_gold = state.get("player",{}).get("gold", 0)
 
                 if auto:
-                    choice = str(unlocked[0]["index"]) if unlocked else "leave"
+                    choice = "leave" if state.get("finished") else (str(unlocked[0]["index"]) if unlocked else "leave")
+                elif state.get("finished"):
+                    choice = get_input(t("Event complete: (leave)", "事件结束：输入 (leave) 离开"), {"leave"}, state=state)
                 else:
                     choice = get_input(t("Choose option [index] or (leave)", "选择 [编号] 或 (leave)离开"), set(valid.keys()), state=state)
 
@@ -1986,10 +2311,7 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
         # Retry loop: if save fails the process stays alive so we can try a different path.
         quit_sent = True
         while True:
-            quit_cmd = {"cmd": "quit"}
-            if quit_save_path:
-                quit_cmd["path"] = quit_save_path
-            result = send(quit_cmd)
+            result = try_send_quit(quit_save_path)
             if result and result.get("type") == "save_error":
                 save_detail = result.get("save") or {}
                 msg = save_detail.get("message", "?")
@@ -2000,17 +2322,22 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
                     ans = ""
                 quit_save_path = ans if ans else None
             else:
-                _show_quit_save_result(result)
+                if result is None and quit_save_path:
+                    print(f"  {c(t('Save failed: simulator disconnected before writing the save.','保存失败：模拟器连接已断开，未写入存档。'), 'red')}")
+                else:
+                    _show_quit_save_result(result)
                 break
+    except _ReloadRequested:
+        reload_requested = True
+        quit_sent = True
+        print(f"\n  {c(t('Reloading current save...', '正在重读当前存档...'), 'yellow')}")
     except KeyboardInterrupt:
         print(f"\n  {c(t('Run abandoned.','已放弃本次运行。'), 'yellow')}")
     finally:
         if not quit_sent:
-            try:
-                result = send({"cmd": "quit"})
+            result = try_send_quit()
+            if result:
                 _show_quit_save_result(result)
-            except Exception:
-                pass
         logger.close()
         if logger.path:
             print(f"\n  [log] {t('Game log saved to','游戏日志已保存至')} {logger.path}")
@@ -2019,6 +2346,16 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
             proc.wait(timeout=5)
         except Exception:
             proc.kill()
+
+    if reload_requested:
+        return play(
+            character=character,
+            seed=actual_seed,
+            auto=auto,
+            ascension=ascension,
+            log=log,
+            native_save_path=native_save_path,
+        )
 
     return restart_requested
 
@@ -2038,8 +2375,6 @@ if __name__ == "__main__":
                        help="Display language: en, zh, or both")
     parser.add_argument("--no-log", action="store_true",
                        help="Disable game logging")
-    parser.add_argument("--load", type=str, default=None,
-                       help="Load a save file (action replay)")
     parser.add_argument("--saves", action="store_true",
                        help="List available saves and exit")
     parser.add_argument("--save-info", type=str, default=None,
@@ -2051,13 +2386,6 @@ if __name__ == "__main__":
     LANG = args.lang
 
     # Mutual exclusion: conflicting flags
-    if args.load is not None:
-        if args.saves:
-            parser.error("Cannot combine --load with --saves")
-        if args.save_info is not None:
-            parser.error("Cannot combine --load with --save-info")
-        if args.continue_save is not None:
-            parser.error("Cannot combine --load with --continue")
     if args.saves:
         if args.save_info is not None:
             parser.error("Cannot combine --saves with --save-info")
@@ -2082,27 +2410,12 @@ if __name__ == "__main__":
         if saves:
             print(f"\n{'─' * 50}")
             for s in saves:
-                stype = s.get("type", "replay")
-                if stype == "native":
-                    print(f"  {s['file']}  [{t('native save','原生存档')}]")
-                else:
-                    print(f"  {s['file']}  {s['character']}  {t('seed','种子')}:{s['seed']}  {t('actions','步操作')}:{s['actions']}")
+                print(f"  {s['file']}  [{t('native save','原生存档')}]")
             print(f"{'─' * 50}")
-            print(f"  {t('Replay saves:','回放存档:')} python3 play.py --load saves/<file>")
-            print(f"  {t('Native saves:','原生存档:')} python3 play.py --continue saves/<file>")
+            print(f"  {t('Load with:','读档命令:')} python3 play.py --continue saves/<file>")
         else:
             print(t("No saves found.", "没有找到存档。"))
         sys.exit(0)
-
-    load_path = None
-    if args.load:
-        p = args.load
-        if not os.path.isabs(p):
-            p = os.path.join(ROOT, p)
-        if not os.path.isfile(p):
-            print(f"Save file not found: {args.load}")
-            sys.exit(1)
-        load_path = p
 
     native_save_path = None
     if args.continue_save is not None:
@@ -2117,16 +2430,13 @@ if __name__ == "__main__":
     ensure_setup()
     next_seed = args.seed
     next_auto = args.auto
-    next_load_path = load_path
     next_native_save_path = native_save_path
     while True:
         restart = play(character=args.character, seed=next_seed, auto=next_auto,
                        ascension=args.ascension, log=not args.no_log,
-                       load_path=next_load_path,
                        native_save_path=next_native_save_path)
         if not restart:
             break
         next_seed = None
         next_auto = False
-        next_load_path = None
         next_native_save_path = None
