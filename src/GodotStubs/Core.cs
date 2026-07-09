@@ -32,6 +32,7 @@ public class Node : GodotObject
 
     private Node? _parent;
     private readonly List<Node> _children = new();
+    private static readonly Dictionary<string, Func<object?>> _headlessNodeFactories = new();
 
     public class MethodName
     {
@@ -58,8 +59,26 @@ public class Node : GodotObject
 
     public T? GetNodeOrNull<T>(string path) where T : class => null;
     public T? GetNodeOrNull<T>(NodePath path) where T : class => null;
-    public T GetNode<T>(string path) where T : class => default!;
-    public T GetNode<T>(NodePath path) where T : class => default!;
+    public static void RegisterHeadlessNodeFactory(Type nodeType, Func<object?> factory)
+    {
+        if (nodeType.FullName != null)
+            _headlessNodeFactories[nodeType.FullName] = factory;
+    }
+
+    public T GetNode<T>(string path) where T : class => CreateHeadlessNode<T>();
+    public T GetNode<T>(NodePath path) where T : class => CreateHeadlessNode<T>();
+    private static T CreateHeadlessNode<T>() where T : class
+    {
+        var typeName = typeof(T).FullName;
+        if (typeName == null || !_headlessNodeFactories.TryGetValue(typeName, out var factory))
+            return default!;
+
+        try
+        {
+            return factory() as T ?? default!;
+        }
+        catch { return default!; }
+    }
 
     public virtual void AddChild(Node child, bool forceReadableName = false, InternalMode mode = InternalMode.Disabled)
     {

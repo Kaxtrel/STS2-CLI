@@ -1,9 +1,11 @@
 """Pytest fixtures: Game process wrapper for unit tests."""
 
 import json
+from collections import deque
 import os
 import shutil
 import subprocess
+import threading
 import pytest
 
 DOTNET = os.path.expanduser("~/.dotnet-arm64/dotnet")
@@ -27,8 +29,15 @@ class Game:
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1, env=env,
         )
+        self._stderr = deque(maxlen=200)
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
         ready = self._read()
         assert ready.get("type") == "ready", f"Expected ready, got: {ready}"
+
+    def _drain_stderr(self):
+        for line in self.proc.stderr:
+            self._stderr.append(line.rstrip())
 
     def _read(self):
         while True:
@@ -74,7 +83,15 @@ class Game:
         except Exception:
             pass
         try:
-            self.proc.terminate()
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(self.proc.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            else:
+                self.proc.terminate()
             self.proc.wait(timeout=5)
         except Exception:
             self.proc.kill()

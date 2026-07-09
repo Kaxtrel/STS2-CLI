@@ -25,3 +25,54 @@ def test_quit_save_defaults_to_save_dir(monkeypatch):
     assert path is not None
     assert path.startswith(play.SAVE_DIR)
     assert path.endswith(".save")
+
+
+def test_writeback_treats_disconnect_after_file_write_as_success(tmp_path):
+    save_path = tmp_path / "run.save"
+
+    def send(_cmd):
+        save_path.write_text('{"ok":true}', encoding="utf-8")
+        raise BrokenPipeError()
+
+    assert play._writeback_continue_save(send, str(save_path)) is True
+
+
+def test_writeback_treats_eof_after_file_write_as_success(tmp_path):
+    save_path = tmp_path / "run.save"
+
+    def send(_cmd):
+        save_path.write_text('{"ok":true}', encoding="utf-8")
+        return None
+
+    assert play._writeback_continue_save(send, str(save_path)) is True
+
+
+def test_writeback_disconnect_without_file_change_is_unknown(tmp_path):
+    save_path = tmp_path / "run.save"
+    save_path.write_text("old", encoding="utf-8")
+
+    def send(_cmd):
+        raise BrokenPipeError()
+
+    assert play._writeback_continue_save(send, str(save_path), confirm_timeout=0) is None
+
+
+def test_writeback_disconnect_with_existing_unchanged_save_is_unknown(tmp_path):
+    save_path = tmp_path / "run.save"
+    save_path.write_text('{"players":[]}', encoding="utf-8")
+
+    def send(_cmd):
+        return None
+
+    assert play._writeback_continue_save(send, str(save_path), confirm_timeout=0) is None
+
+
+def test_confirmed_save_path_requires_same_readable_save(tmp_path):
+    save_path = tmp_path / "run.save"
+    save_path.write_text('{"players":[]}', encoding="utf-8")
+
+    assert play._is_confirmed_save_path(str(save_path), str(save_path)) is True
+    assert play._is_confirmed_save_path(str(save_path), str(tmp_path / "other.save")) is False
+
+    save_path.write_text("not json", encoding="utf-8")
+    assert play._is_confirmed_save_path(str(save_path), str(save_path)) is False

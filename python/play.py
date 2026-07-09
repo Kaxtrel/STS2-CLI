@@ -16,6 +16,7 @@ import os
 import argparse
 import random
 import threading
+import time
 from game_log import GameLogger
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -623,6 +624,17 @@ def card_desc(card, upgraded=False, in_combat=False):
     return resolve_template(d, stats, in_combat=in_combat)  # always resolve (handles energyPrefix etc.)
 
 
+def format_description(item_or_text, vars_dict=None, in_combat=False):
+    if isinstance(item_or_text, dict):
+        vars_dict = item_or_text.get("vars") or vars_dict or {}
+        text = item_or_text.get("description", "")
+    else:
+        text = item_or_text
+        vars_dict = vars_dict or {}
+    text = desc(text, vars_dict=vars_dict, in_combat=in_combat)
+    return resolve_template(text, vars_dict, in_combat=in_combat) if vars_dict or text else text
+
+
 def _card_kw_label(kw):
     return t(kw, CARD_KW_ZH.get(kw, kw))
 
@@ -738,10 +750,7 @@ def relic_str(r):
     """Format a relic with name and resolved description."""
     if isinstance(r, dict) and "name" in r:
         name = n(r["name"])
-        # Resolve template vars with actual values
-        vars_dict = r.get("vars") or {}
-        d = desc(r.get("description", {}), vars_dict=vars_dict)
-        d = resolve_template(d, vars_dict)
+        d = format_description(r)
         return f"{name}" + (f": {c(d, 'dim')}" if d else "")
     return n(r)
 
@@ -749,9 +758,7 @@ def potion_str(p):
     """Format a potion with name and resolved description."""
     if isinstance(p, dict) and "name" in p:
         name = n(p["name"])
-        vars_dict = p.get("vars") or {}
-        d = desc(p.get("description", {}), vars_dict=vars_dict)
-        d = resolve_template(d, vars_dict) if vars_dict else d
+        d = format_description(p)
         idx = p.get("index", "?")
         return f"[{idx}] {name}" + (f": {c(d, 'dim')}" if d else "")
     return n(p)
@@ -852,7 +859,7 @@ def show_combat_round_status(state):
     print(f"  {c(t(f'Round {rnd}',f'回合 {rnd}'), 'bold')}  {t('Energy','能量')} {c(f'{energy}/{max_energy}', 'cyan')}  {t('Draw','抽牌')} {draw}  {t('Discard','弃牌')} {discard}")
 
 
-def show_combat(state):
+def show_combat(state, include_hand=True):
     print(f"\n{'─' * 60}")
 
     p = state.get("player", {})
@@ -921,6 +928,8 @@ def show_combat(state):
     show_combat_player_status(state)
     show_combat_round_status(state)
     print()
+    if not include_hand:
+        return
 
     hand = state.get("hand", [])
     for card in hand:
@@ -1124,8 +1133,7 @@ def show_shop(state):
         if not r.get("is_stocked"): continue
         cost = r.get("cost", 0)
         affordable = c(str(cost), "green") if cost <= gold else c(str(cost), "red")
-        r_vars = r.get("vars") or {}
-        r_desc = resolve_template(desc(r.get("description", ""), vars_dict=r_vars), r_vars)
+        r_desc = format_description(r)
         print(f"  [r{r['index']}] {n(r['name'])} — {affordable}{t('g','金')}")
         if r_desc:
             print(f"      {c(r_desc, 'dim')}")
@@ -1135,8 +1143,7 @@ def show_shop(state):
         if not p.get("is_stocked"): continue
         cost = p.get("cost", 0)
         affordable = c(str(cost), "green") if cost <= gold else c(str(cost), "red")
-        p_vars = p.get("vars") or {}
-        p_desc = resolve_template(desc(p.get("description", ""), vars_dict=p_vars), p_vars)
+        p_desc = format_description(p)
         print(f"  [p{p['index']}] {n(p['name'])} — {affordable}{t('g','金')}")
         if p_desc:
             print(f"      {c(p_desc, 'dim')}")
@@ -1241,13 +1248,7 @@ def show_event(state):
             title = n(raw_title)
         else:
             title = loc_resolve(raw_title) if '.' in str(raw_title) or str(raw_title).isupper() else raw_title
-        # Show option description with resolved template vars
-        raw_desc = opt.get("description")
-        # Resolve template vars like [MaxHp], [Gold], {Cards}
-        opt_vars = opt.get("vars") or {}
-        opt_desc = desc(raw_desc, vars_dict=opt_vars) if raw_desc else ""
-        if opt_vars and opt_desc:
-            opt_desc = resolve_template(opt_desc, opt_vars)
+        opt_desc = format_description(opt)
         desc_str = f" — {c(opt_desc, 'dim')}" if opt_desc else ""
         print(f"  {mark} [{opt['index']}] {title}{desc_str}")
 
@@ -1269,6 +1270,11 @@ def _render_map(map_data, choice_set=None, choice_indices=None):
         "Monster": "M", "Elite": "E", "Boss": "B",
         "RestSite": "R", "Shop": "$", "Treasure": "T",
         "Event": "?", "Unknown": "?", "Ancient": "A",
+    }
+    ROOM_COLORS = {
+        "Monster": "dim", "Elite": "red", "Boss": "red",
+        "RestSite": "green", "Shop": "yellow", "Treasure": "cyan",
+        "Event": "magenta", "Unknown": "magenta", "Ancient": "cyan",
     }
 
     rows = map_data.get("rows", [])
@@ -1295,6 +1301,7 @@ def _render_map(map_data, choice_set=None, choice_indices=None):
     boss = map_data.get("boss", {})
     boss_col = boss.get("col", 0)
     boss_row = boss.get("row", -1)
+    boss_name = n(boss.get("name") or (ctx.get("boss") or {}).get("name") or "")
     max_col = max(max_col, boss_col)
     row_numbers = sorted(row_numbers)
     total_cols = max_col + 1
@@ -1315,7 +1322,8 @@ def _render_map(map_data, choice_set=None, choice_indices=None):
     line = "".join(buf)
     boss_color = "yellow" if boss_choice_idx is not None else "red"
     line = line[:boss_center] + c("B", boss_color) + line[boss_center + 1:]
-    print(f"  {c('B','dim')} | {line}")
+    boss_suffix = f"  {c(boss_name, boss_color)}" if boss_name else ""
+    print(f"  {c('B','dim')} | {line}{boss_suffix}")
     if boss_choice_idx is not None:
         ann = list(" " * (W * total_cols))
         label = f"[{boss_choice_idx}]"
@@ -1374,6 +1382,7 @@ def _render_map(map_data, choice_set=None, choice_indices=None):
                 color_subs.append((center, center + 1, c(icon, "dim")))
             else:
                 buf[center] = icon
+                color_subs.append((center, center + 1, c(icon, ROOM_COLORS.get(nd.get("type", ""), "reset"))))
 
         line = "".join(buf)
         # Apply colors right-to-left
@@ -1431,7 +1440,8 @@ def _render_map(map_data, choice_set=None, choice_indices=None):
             if nd is None and col == boss_col and row == boss_row:
                 nd = boss
             if nd:
-                ntype = t(nd.get("type", "?"), NODE_TYPE_ZH.get(nd.get("type", ""), nd.get("type", "?")))
+                name = nd.get("name")
+                ntype = n(name) if name else t(nd.get("type", "?"), NODE_TYPE_ZH.get(nd.get("type", ""), nd.get("type", "?")))
                 parts.append(f"{c(str(i), 'yellow')}={ntype}")
         print(f"  {' '.join(parts)}")
     print()
@@ -1452,6 +1462,50 @@ def _draw_conn(buf, from_col, to_col, W):
         if 0 <= mid < len(buf):
             buf[mid] = ch
 
+def show_help():
+    if LANG == "zh":
+        print(f"""
+  {c('命令:', 'bold')}
+    {c('help', 'cyan')}     — 帮助
+    {c('map', 'cyan')}      — 显示地图
+    {c('deck', 'cyan')}     — 查看牌组
+    {c('potions', 'cyan')}  — 查看药水
+    {c('relics', 'cyan')}   — 查看遗物
+    {c('save', 'cyan')}     — 存档
+    {c('sl', 'cyan')}       — 读取当前存档
+    {c('saves', 'cyan')}    — 查看存档列表
+    {c('quit', 'cyan')}     — 退出
+    {c('abandon', 'cyan')}  — 放弃本局
+
+  {c('操作:', 'bold')}
+    地图:    输入路径编号
+    战斗:    卡牌编号 / {c('0,1', 'yellow')} 连续出牌 / {c('e', 'yellow')} 结束回合 / {c('p0', 'yellow')} 使用药水
+    奖励:    卡牌编号 / {c('s', 'yellow')} 跳过
+    多选:    用逗号分隔编号，例如 {c('0,1,2', 'yellow')}
+    宝箱/事件/商店: 输入选项编号或 {c('leave', 'yellow')} 离开
+""")
+    else:
+        print(f"""
+  {c('Commands:', 'bold')}
+    {c('help', 'cyan')}     — show this help
+    {c('map', 'cyan')}      — show map
+    {c('deck', 'cyan')}     — show deck
+    {c('potions', 'cyan')}  — show potions
+    {c('relics', 'cyan')}   — show relics
+    {c('save', 'cyan')}     — save game
+    {c('sl', 'cyan')}       — reload current save
+    {c('saves', 'cyan')}    — list saves
+    {c('quit', 'cyan')}     — quit
+    {c('abandon', 'cyan')}  — abandon run
+
+  {c('Actions:', 'bold')}
+    Map:     path number
+    Combat:  card index / {c('0,1', 'yellow')} sequence / {c('e', 'yellow')} end turn / {c('p0', 'yellow')} use potion
+    Reward:  card index / {c('s', 'yellow')} skip
+    Multi:   comma-separate indices, e.g. {c('0,1,2', 'yellow')}
+    Chest/Event/Shop: option index or {c('leave', 'yellow')} leave
+""")
+
 def get_input(prompt, valid_options=None, state=None, multi_select=False, multi_min=1, multi_max=1):
     """Get user input with validation. Supports meta-commands: help, map, deck, potions.
 
@@ -1471,53 +1525,7 @@ def get_input(prompt, valid_options=None, state=None, multi_select=False, multi_
 
         # Meta-commands available at any prompt
         if raw == "help":
-            if LANG == "zh":
-                print(f"""
-  {c('命令:', 'bold')}
-    {c('help', 'cyan')}     — 帮助
-    {c('map', 'cyan')}      — 显示地图
-    {c('deck', 'cyan')}     — 查看牌组
-    {c('potions', 'cyan')}  — 查看药水
-    {c('relics', 'cyan')}   — 查看遗物
-    {c('quit', 'cyan')}     — 退出
-    {c('save', 'cyan')}     — 存档
-    {c('sl', 'cyan')}       — 重读当前存档
-    {c('saves', 'cyan')}    — 查看存档列表
-
-  {c('操作:', 'bold')}
-    地图:    输入路径编号 (0, 1, 2)
-    战斗:    卡牌编号或 {c('0,1', 'yellow')} 连续出牌 / {c('e', 'yellow')} 结束回合 / {c('p0', 'yellow')} 使用药水
-    奖励:    卡牌编号 / {c('s', 'yellow')} 跳过
-    宝箱:    {c('leave', 'yellow')} 继续
-    多选:    按提示选择张数（须选 N–M 张 / 可选 0–M 张等），编号逗号分隔，例如 {c('0,1,2', 'yellow')}
-    休息:    选项编号
-    事件:    选项编号 / {c('leave', 'yellow')} 离开
-    商店:    {c('c0', 'yellow')} 买卡 / {c('r0', 'yellow')} 遗物 / {c('p0', 'yellow')} 药水 / {c('rm', 'yellow')} 移除 / {c('leave', 'yellow')} 离开
-""")
-            else:
-                print(f"""
-  {c('Commands:', 'bold')}
-    {c('help', 'cyan')}     — show this help
-    {c('map', 'cyan')}      — show map
-    {c('deck', 'cyan')}     — show deck
-    {c('potions', 'cyan')}  — show potions
-    {c('relics', 'cyan')}   — show relics
-    {c('quit', 'cyan')}     — quit
-    {c('abandon', 'cyan')}  — abandon run (forfeit)
-    {c('save', 'cyan')}     — save game
-    {c('sl', 'cyan')}       — reload current save
-    {c('saves', 'cyan')}    — list saves
-
-  {c('Actions:', 'bold')}
-    Map:     path number (0, 1, 2)
-    Combat:  card index or {c('0,1', 'yellow')} sequence / {c('e', 'yellow')} end turn / {c('p0', 'yellow')} use potion
-    Reward:  card index / {c('s', 'yellow')} skip
-    Treasure:{c('leave', 'yellow')} continue
-    Multi:   when prompted for N–M cards (or 0–M optional), comma-separate indices, e.g. {c('0,1,2', 'yellow')}
-    Rest:    option index
-    Event:   option index / {c('leave', 'yellow')} leave
-    Shop:    {c('c0', 'yellow')} card / {c('r0', 'yellow')} relic / {c('p0', 'yellow')} potion / {c('rm', 'yellow')} remove / {c('leave', 'yellow')} leave
-""")
+            show_help()
             continue
         if raw == "deck" and state:
             p = state.get("player", {})
@@ -1806,20 +1814,78 @@ def _show_quit_save_result(result):
         print(f"  {c(t('Saved!','已存档!'), 'green')} ({sz // 1024}KB)")
         if save_path:
             print(f"  {t('Save path:','存档位置:')} {c(save_path, 'cyan')}")
-            print(f"  {t('Continue later:','下次继续:')} python3 play.py --continue {save_path}")
     elif save_result:
         print(f"  {c(t('Save failed:','存档失败:'), 'red')} {save_result.get('message', '?')}")
 
 
-def _writeback_continue_save(send_fn, native_save_path):
+def _save_signature(path):
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _is_readable_native_save(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(data, dict) and isinstance(data.get("players"), list)
+
+
+def _is_confirmed_save_path(path, confirmed_path):
+    return (
+        path
+        and confirmed_path == os.path.abspath(path)
+        and os.path.isfile(path)
+        and _is_readable_native_save(path)
+    )
+
+
+def _save_changed_after(path, before, timeout=1.5):
+    deadline = time.monotonic() + timeout
+    while True:
+        after = _save_signature(path)
+        if after is not None and after != before:
+            return after
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.05)
+
+
+def _print_save_written(size):
+    print(f"  {c(t(f'Save written ({size//1024}KB)', f'存档已写入 ({size//1024}KB)'), 'dim')}")
+
+
+def _confirm_save_written(path, before, timeout):
+    changed = _save_changed_after(path, before, timeout=timeout)
+    if changed is not None:
+        _print_save_written(changed[1])
+        return True
+
+    return False
+
+
+def _writeback_continue_save(send_fn, native_save_path, confirm_timeout=1.5):
     """Best-effort writeback for --continue sessions when a stable map checkpoint is reached."""
     if not native_save_path:
         return False
-    result = send_fn({"cmd": "write_continue_save", "path": native_save_path})
+    before = _save_signature(native_save_path)
+    try:
+        result = send_fn({"cmd": "write_continue_save", "path": native_save_path})
+    except (BrokenPipeError, OSError, ValueError):
+        if _confirm_save_written(native_save_path, before, confirm_timeout):
+            return True
+        return None
     if result and result.get("success"):
-        sz = result.get("size", 0)
-        print(f"  {c(t(f'Save written ({sz//1024}KB)', f'存档已写入 ({sz//1024}KB)'), 'dim')}")
+        _print_save_written(result.get("size", 0))
         return True
+    if result is None:
+        if _confirm_save_written(native_save_path, before, confirm_timeout):
+            return True
+        return None
     elif result:
         print(f"  {c(t('Save failed:','存档写入失败:'), 'red')} {result.get('message','?')}")
     return False
@@ -1835,6 +1901,13 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
     load_native_save_path = native_save_path
     if native_save_path is None:
         native_save_path = _timestamped_save_path(character, actual_seed, ".save")
+    stable_checkpoint_path = (
+        os.path.abspath(load_native_save_path)
+        if load_native_save_path and _is_readable_native_save(load_native_save_path)
+        else None
+    )
+    checkpoint_dirty = load_native_save_path is None
+    current_decision = None
 
     logger = GameLogger(character, actual_seed, enabled=log)
     proc = subprocess.Popen(
@@ -1856,10 +1929,14 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
                 return resp
 
     def send(cmd):
+        nonlocal checkpoint_dirty
         logger.log_action(cmd)
         proc.stdin.write(json.dumps(cmd) + "\n")
         proc.stdin.flush()
-        return read()
+        resp = read()
+        if cmd.get("cmd") == "action" and resp and resp.get("type") != "error":
+            checkpoint_dirty = True
+        return resp
 
     def try_send_quit(path=None):
         quit_cmd = {"cmd": "quit"}
@@ -1877,11 +1954,42 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
     get_input._reload_path = native_save_path
     get_input._reload_available = bool(native_save_path and os.path.isfile(native_save_path))
 
+    def remember_stable_checkpoint(path):
+        nonlocal stable_checkpoint_path, checkpoint_dirty
+        stable_checkpoint_path = os.path.abspath(path)
+        checkpoint_dirty = False
+
+    def has_current_stable_checkpoint(path):
+        return (
+            not checkpoint_dirty
+            and _is_confirmed_save_path(path, stable_checkpoint_path)
+        )
+
+    def can_reuse_previous_stable_checkpoint(path):
+        return (
+            current_decision not in (None, "map_select", "game_over")
+            and _is_confirmed_save_path(path, stable_checkpoint_path)
+        )
+
+    def show_continue_hint(path):
+        print(f"  {t('Save path:','存档位置:')} {c(path, 'cyan')}")
+
+    def show_reused_checkpoint(path):
+        print(f"  {c(t('Using last stable checkpoint.','使用上一个稳定检查点。'), 'dim')}")
+        show_continue_hint(path)
+
     def do_save():
-        if _writeback_continue_save(send, native_save_path):
+        if can_reuse_previous_stable_checkpoint(native_save_path):
+            show_reused_checkpoint(native_save_path)
+            return
+        save_ok = _writeback_continue_save(send, native_save_path)
+        if save_ok is True:
             get_input._reload_available = True
-            print(f"  {t('Save path:','存档位置:')} {c(native_save_path, 'cyan')}")
-            print(f"  {t('Continue later:','下次继续:')} python3 play.py --continue {native_save_path}")
+            remember_stable_checkpoint(native_save_path)
+            show_continue_hint(native_save_path)
+            return
+        if save_ok is None:
+            print(f"  {c(t('Save status unknown: simulator disconnected while saving.','保存状态未知：模拟器在保存时断开。'), 'yellow')}")
             return
 
         print(f"  {c(t('Save failed; no save was written.','保存失败，未写入存档。'), 'red')}")
@@ -1948,6 +2056,7 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
                 continue
 
             dec = state.get("decision", "")
+            current_decision = dec
 
             if dec == "game_over":
                 victory = state.get("victory", False)
@@ -1991,6 +2100,7 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
             elif dec == "map_select":
                 if _writeback_continue_save(send, native_save_path):
                     get_input._reload_available = True
+                    remember_stable_checkpoint(native_save_path)
                 show_map(state, send_fn=send)
                 choices = state.get("choices", [])
 
@@ -2131,7 +2241,10 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
                 min_sel = state.get("min_select", 1)
                 max_sel = state.get("max_select", 1)
                 print(f"  {c(t('Choose cards','选择卡牌'), 'bold')} — {card_pick_quantity_hint(min_sel, max_sel)}")
-                show_player(state.get("player", {}))
+                if state.get("enemies"):
+                    show_combat(state, include_hand=False)
+                else:
+                    show_player(state.get("player", {}))
                 print()
                 cards = state.get("cards", [])
                 for cd in cards:
@@ -2308,25 +2421,33 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
     except _QuitRequested:
         quit_sent = False
         quit_save_path = _quit_with_save(native_save_path, character, actual_seed)
-        # Retry loop: if save fails the process stays alive so we can try a different path.
         quit_sent = True
-        while True:
-            result = try_send_quit(quit_save_path)
-            if result and result.get("type") == "save_error":
-                save_detail = result.get("save") or {}
-                msg = save_detail.get("message", "?")
-                print(f"  {c(t('Save failed:','存档失败:'), 'red')} {msg}")
-                try:
-                    ans = input(f"  {t('New path (Enter = quit without saving): ','新路径（回车则不保存退出）: ')}").strip()
-                except (EOFError, KeyboardInterrupt):
-                    ans = ""
-                quit_save_path = ans if ans else None
-            else:
-                if result is None and quit_save_path:
-                    print(f"  {c(t('Save failed: simulator disconnected before writing the save.','保存失败：模拟器连接已断开，未写入存档。'), 'red')}")
-                else:
-                    _show_quit_save_result(result)
+        while quit_save_path:
+            if has_current_stable_checkpoint(quit_save_path):
+                print(f"  {c(t('Already saved.','存档已保存。'), 'green')}")
+                show_continue_hint(quit_save_path)
                 break
+            if can_reuse_previous_stable_checkpoint(quit_save_path):
+                show_reused_checkpoint(quit_save_path)
+                break
+            save_ok = _writeback_continue_save(send, quit_save_path)
+            if save_ok is True:
+                get_input._reload_available = True
+                remember_stable_checkpoint(quit_save_path)
+                show_continue_hint(quit_save_path)
+                break
+            if save_ok is None:
+                print(f"  {c(t('Save status unknown: simulator disconnected while saving.','保存状态未知：模拟器在保存时断开。'), 'yellow')}")
+                break
+            try:
+                ans = input(f"  {t('New path (Enter = quit without saving): ','新路径（回车则不保存退出）: ')}").strip()
+            except (EOFError, KeyboardInterrupt):
+                ans = ""
+            quit_save_path = ans if ans else None
+
+        result = try_send_quit()
+        if result:
+            _show_quit_save_result(result)
     except _ReloadRequested:
         reload_requested = True
         quit_sent = True
@@ -2346,6 +2467,12 @@ def play(character="Ironclad", seed=None, auto=False, ascension=0, log=True,
             proc.wait(timeout=5)
         except Exception:
             proc.kill()
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                if stream:
+                    stream.close()
+            except OSError:
+                pass
 
     if reload_requested:
         return play(
