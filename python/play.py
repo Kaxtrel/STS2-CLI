@@ -631,8 +631,13 @@ def format_description(item_or_text, vars_dict=None, in_combat=False):
     else:
         text = item_or_text
         vars_dict = vars_dict or {}
-    text = desc(text, vars_dict=vars_dict, in_combat=in_combat)
-    return resolve_template(text, vars_dict, in_combat=in_combat) if vars_dict or text else text
+    for _ in range(4):
+        resolved = desc(text, vars_dict=vars_dict, in_combat=in_combat)
+        resolved = resolve_template(resolved, vars_dict, in_combat=in_combat) if vars_dict or resolved else resolved
+        if resolved == text:
+            return resolved
+        text = resolved
+    return text
 
 
 def _card_kw_label(kw):
@@ -759,8 +764,8 @@ def potion_str(p):
     if isinstance(p, dict) and "name" in p:
         name = n(p["name"])
         d = format_description(p)
-        idx = p.get("index", "?")
-        return f"[{idx}] {name}" + (f": {c(d, 'dim')}" if d else "")
+        prefix = f"[{p['index']}] " if "index" in p else ""
+        return f"{prefix}{name}" + (f": {c(d, 'dim')}" if d else "")
     return n(p)
 
 def show_player_inventory(p):
@@ -992,6 +997,14 @@ def show_map(state, send_fn=None):
         ntype = t(ch["type"], NODE_TYPE_ZH.get(ch["type"], ch["type"]))
         print(f"  [{i}] {icon} {ntype}")
 
+def _upgrade_stat_change(k, old, new_val):
+    if k in ("damage", "calculateddamage", "ostydamage"):
+        return "damage", c(f"{t('dmg','伤害')} {old}→{new_val}", "red")
+    if k in ("block", "calculatedblock"):
+        return "block", c(f"{t('blk','格挡')} {old}→{new_val}", "blue")
+    return k, c(f"{old}→{new_val}", "green")
+
+
 def _format_upgrade_preview(stats, aug, current_cost=None, current_description=None, in_combat=False):
     """Format upgrade preview string."""
     if not aug:
@@ -1004,16 +1017,17 @@ def _format_upgrade_preview(stats, aug, current_cost=None, current_description=N
         parts.append(c(f"{t('cost','费用')} {current_cost}→{aug_cost}", "green"))
     # Compare all stats, show changed values with readable names
     all_keys = set(list(stats.keys()) + list(aug_stats.keys()))
+    seen_stat_changes = set()
     for k in sorted(all_keys):
         old = stats.get(k, 0)
         new_val = aug_stats.get(k, old)
         if new_val != old:
-            if k == "damage":
-                parts.append(c(f"{t('dmg','伤害')} {old}→{new_val}", "red"))
-            elif k == "block":
-                parts.append(c(f"{t('blk','格挡')} {old}→{new_val}", "blue"))
-            else:
-                parts.append(c(f"{old}→{new_val}", "green"))
+            change_type, text = _upgrade_stat_change(k, old, new_val)
+            change_key = (change_type, old, new_val)
+            if change_key in seen_stat_changes:
+                continue
+            seen_stat_changes.add(change_key)
+            parts.append(text)
     # Keyword changes (e.g., Discovery removes Exhaust)
     for kw in (aug.get("removed_keywords") or []):
         parts.append(c(f"-{_card_kw_label(kw)}", "green"))
@@ -1069,6 +1083,12 @@ def show_card_reward(state):
     gold_earned = state.get("gold_earned", 0)
     if gold_earned > 0:
         print(f"  {c(t('Combat won!','战斗胜利!'), 'green')} +{c(str(gold_earned), 'yellow')}{t('g','金')}")
+    rewards = state.get("rewards") or []
+    if rewards:
+        print(f"  {c(t('Rewards:','获得:'), 'yellow')}")
+        for reward in rewards:
+            if reward.get("reward_type") == "potion":
+                print(f"    🧪 {potion_str(reward)}")
     print(f"  {c(t('Card Reward','卡牌奖励'), 'bold')} — {t('choose one (or skip)','选一张（或跳过）')}")
     show_player(state.get("player", {}))
     print()
@@ -1248,6 +1268,7 @@ def show_event(state):
             title = n(raw_title)
         else:
             title = loc_resolve(raw_title) if '.' in str(raw_title) or str(raw_title).isupper() else raw_title
+        title = format_description(title, opt.get("vars"))
         opt_desc = format_description(opt)
         desc_str = f" — {c(opt_desc, 'dim')}" if opt_desc else ""
         print(f"  {mark} [{opt['index']}] {title}{desc_str}")

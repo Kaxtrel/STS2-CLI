@@ -76,3 +76,59 @@ def test_confirmed_save_path_requires_same_readable_save(tmp_path):
 
     save_path.write_text("not json", encoding="utf-8")
     assert play._is_confirmed_save_path(str(save_path), str(save_path)) is False
+
+
+def test_potion_str_shows_slot_only_for_inventory_potions():
+    assert play.potion_str({"name": "Dex Potion", "index": 2}) == "[2] Dex Potion"
+    assert play.potion_str({"name": "Dex Potion"}) == "Dex Potion"
+
+
+def test_upgrade_preview_merges_duplicate_damage_vars():
+    parts = play._format_upgrade_preview(
+        {"damage": 6, "ostydamage": 6},
+        {"stats": {"damage": 9, "ostydamage": 9}},
+    )
+
+    assert parts is not None
+    assert len(parts) == 1
+    assert "6→9" in parts[0]
+
+
+def test_upgrade_preview_keeps_different_stat_types():
+    parts = play._format_upgrade_preview(
+        {"damage": 6, "block": 6},
+        {"stats": {"damage": 9, "block": 9}},
+    )
+
+    assert parts is not None
+    assert len(parts) == 2
+
+
+def test_format_description_resolves_nested_vars():
+    text = play.format_description({
+        "description": "支付{Cost}金币。{Effect}",
+        "vars": {
+            "Cost": 50,
+            "Effect": "在你接下来的{Combats}场战斗开始时，升级你的初始手牌。",
+            "Combats": 1,
+        },
+    })
+
+    assert text == "支付50金币。在你接下来的1场战斗开始时，升级你的初始手牌。"
+
+
+def test_show_event_resolves_title_vars(capsys):
+    play.show_event({
+        "event_name": "Test Event",
+        "options": [{
+            "index": 0,
+            "title": "Insert {Rarity} Potion",
+            "description": "Lose {Potion}.",
+            "vars": {"Rarity": "Common", "Potion": "Block Potion"},
+        }],
+        "player": {},
+    })
+
+    output = capsys.readouterr().out
+    assert "Insert Common Potion" in output
+    assert "{Rarity}" not in output

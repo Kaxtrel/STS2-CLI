@@ -35,3 +35,29 @@ class TestEventDescriptions:
         for opt in state.get("options", []):
             d = opt.get("description") or ""
             assert "IsMultiplayer" not in d
+
+    def test_event_option_description_vars_are_localized(self, game):
+        state = game.start(seed="tea-master", lang="zh")
+        game.skip_neow(state)
+        game.set_player(gold=414)
+        state = game.enter_room("event", event="TEA_MASTER")
+
+        assert state["decision"] == "event_choice"
+        values = [
+            str(value)
+            for opt in state.get("options", [])
+            for value in (opt.get("vars") or {}).values()
+        ]
+        assert values
+        assert all(".description" not in value for value in values)
+
+    def test_future_of_potions_option_vars(self, game):
+        state = game.start(character="Necrobinder", seed="future-potions", lang="zh")
+        game.skip_neow(state)
+        game.set_player(potions=["BLOCK_POTION", "SNECKO_OIL", "DOOM_POTION"])
+        state = game.enter_room("event", event="THE_FUTURE_OF_POTIONS")
+
+        assert state["decision"] == "event_choice"
+        assert state["options"]
+        for option in state["options"]:
+            assert {"Potion", "Rarity", "Type"} <= set(option["vars"] or {})

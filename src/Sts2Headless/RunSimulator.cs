@@ -212,20 +212,25 @@ internal class LocLookup
     /// <summary>Resolve a full loc key like "TABLE.KEY.SUB" by searching all tables.</summary>
     public string BilingualFromKey(string locKey)
     {
+        return BilingualFromKeyOrNull(locKey) ?? locKey;
+    }
+
+    public string? BilingualFromKeyOrNull(string locKey)
+    {
         if (Lang == "zh")
         {
             foreach (var tableName in _zhs.Keys)
             {
                 var zh = _zhs.GetValueOrDefault(tableName)?.GetValueOrDefault(locKey);
-                if (zh != null) return zh;
+                if (zh != null) return StripBBCode(zh);
             }
         }
         foreach (var tableName in _eng.Keys)
         {
             var en = _eng.GetValueOrDefault(tableName)?.GetValueOrDefault(locKey);
-            if (en != null) return en;
+            if (en != null) return StripBBCode(en);
         }
-        return locKey;
+        return null;
     }
 
     public bool IsLoaded => _eng.Count > 0;
@@ -386,6 +391,11 @@ internal sealed class DisplayVarExtractor
             suffix += "+";
             value = value[..^1];
         }
+
+        var locKeyValue = _loc.BilingualFromKeyOrNull(value);
+        if (locKeyValue != null)
+            return locKeyValue + suffix;
+
         if (value.EndsWith(".title", StringComparison.Ordinal))
             value = value[..^".title".Length];
         if (value.StartsWith("CARD.", StringComparison.Ordinal))
@@ -458,9 +468,13 @@ public class RunSimulator
     // Pending rewards for card selection (populated after combat, before proceeding)
     private List<Reward>? _pendingRewards;
     private CardReward? _pendingCardReward;
+    private List<Dictionary<string, object?>>? _pendingAutoRewards;
     private bool _rewardsProcessed;
     private int _goldBeforeCombat;
     private int _lastKnownHp;
+    private bool _shopCardRemovalPurchased;
+    private bool _shopCardRemovalPending;
+    private int _shopCardRemovalDeckSize;
     private readonly HeadlessCardSelector _cardSelector = new();
     // Pending bundle selection (Scroll Boxes: pick 1 of N packs)
     private IReadOnlyList<IReadOnlyList<CardModel>>? _pendingBundles;
@@ -476,6 +490,9 @@ public class RunSimulator
             _pendingBundles = null;
             _pendingBundleTcs = null;
             _pendingBundleSelected = null;
+            _shopCardRemovalPurchased = false;
+            _shopCardRemovalPending = false;
+            _shopCardRemovalDeckSize = 0;
             EnsureModelDbInitialized();
 
             var player = CreatePlayer(character);
@@ -1169,6 +1186,7 @@ public class RunSimulator
         // Reset tracking for new room
         _rewardsProcessed = false;
         _pendingCardReward = null;
+        _pendingAutoRewards = null;
         _eventOptionChosen = false;
         _lastEventOptionCount = 0;
         _pendingEventOptionTask = null;
@@ -1178,6 +1196,9 @@ public class RunSimulator
         _pendingBundles = null;
         _pendingBundleTcs = null;
         _pendingRewards = null;
+        _shopCardRemovalPurchased = false;
+        _shopCardRemovalPending = false;
+        _shopCardRemovalDeckSize = 0;
         _lastKnownHp = player.Creature?.CurrentHp ?? 0;
 
         var coord = new MapCoord((byte)col, (byte)row);
@@ -1421,6 +1442,7 @@ public class RunSimulator
 
         var completedReward = _pendingCardReward;
         _pendingCardReward = null;
+        _pendingAutoRewards = null;
         return NextPendingCardReward(player, completedReward);
     }
 
@@ -1442,6 +1464,7 @@ public class RunSimulator
             var completedReward = _pendingCardReward;
             _pendingCardReward.OnSkipped();
             _pendingCardReward = null;
+            _pendingAutoRewards = null;
             return NextPendingCardReward(player, completedReward);
         }
         return DetectDecisionPoint();
@@ -1624,6 +1647,8 @@ public class RunSimulator
 
         var removal = merchantRoom.GetLocalInventory().CardRemovalEntry;
         if (removal == null) return Error("No card removal available");
+        if (_shopCardRemovalPurchased) return Error("Card removal already purchased");
+        if (_shopCardRemovalPending) return Error("Card removal already in progress");
         if (player.Gold < removal.Cost) return Error("Not enough gold");
 
         try
@@ -1631,14 +1656,32 @@ public class RunSimulator
             var task = Task.Run(() => removal.OnTryPurchaseWrapper(merchantRoom.GetLocalInventory()));
             if (WaitForTaskOrPendingChoice(task, includeRewardsAndBundles: false))
             {
+                _shopCardRemovalPending = true;
+                _shopCardRemovalDeckSize = player.Deck.Cards.Count;
                 WaitForActionExecutor();
                 return DetectDecisionPoint();
             }
+            _shopCardRemovalPurchased = true;
             Log($"Removed card for {removal.Cost}g");
         }
         catch (Exception ex) { return Error($"Remove card failed: {ex.Message}"); }
 
         return DetectDecisionPoint();
+    }
+
+    private void RemoveCardFromDeck(Player player, CardModel selectedCard)
+    {
+        var deckCard = player.Deck.Cards.FirstOrDefault(c => ReferenceEquals(c, selectedCard))
+            ?? player.Deck.Cards.FirstOrDefault(c => c.Id == selectedCard.Id);
+        var cards = deckCard == null ? null : GetBackingList<CardModel>(player.Deck, "_cards");
+        if (deckCard == null || cards == null || !cards.Remove(deckCard))
+        {
+            Log("Shop card removal fallback could not remove the selected card");
+            return;
+        }
+
+        _runState?.RemoveCard(deckCard);
+        Log($"Shop card removal fallback removed {deckCard.Id.Entry}");
     }
 
     private Dictionary<string, object?> DoSelectBundle(Player player, Dictionary<string, object?>? args)
@@ -1677,6 +1720,7 @@ public class RunSimulator
         if (parseError != null)
             return Error(parseError);
 
+        var selectedCard = _cardSelector.PendingOptions?[indices[0]];
         Log($"Card selection: indices [{string.Join(",", indices)}]");
         _cardSelector.ResolvePendingByIndices(indices);
         _syncCtx.Pump();
@@ -1708,6 +1752,14 @@ public class RunSimulator
             Thread.Sleep(200);
             _syncCtx.Pump();
             WaitForActionExecutor();
+            if (_shopCardRemovalPending)
+            {
+                _shopCardRemovalPending = false;
+                _shopCardRemovalPurchased = true;
+                if (player.Deck.Cards.Count >= _shopCardRemovalDeckSize && selectedCard != null)
+                    RemoveCardFromDeck(player, selectedCard);
+                _shopCardRemovalDeckSize = 0;
+            }
             Log("Card selection in shop (card removal), refreshing shop state");
         }
 
@@ -1874,6 +1926,8 @@ public class RunSimulator
         {
             Log("Skipping card selection");
             _cardSelector.CancelPending();
+            _shopCardRemovalPending = false;
+            _shopCardRemovalDeckSize = 0;
             _syncCtx.Pump();
             WaitForActionExecutor();
             WaitForPendingEventOptionContinuation();
@@ -2071,6 +2125,9 @@ public class RunSimulator
         try { RunManager.Instance.ProceedFromTerminalRewardsScreen().GetAwaiter().GetResult(); }
         catch { }
         _pendingTreasureState = null;
+        _shopCardRemovalPurchased = false;
+        _shopCardRemovalPending = false;
+        _shopCardRemovalDeckSize = 0;
         _syncCtx.Pump();
         WaitForActionExecutor();
 
@@ -2922,12 +2979,21 @@ public class RunSimulator
 
                 // Auto-collect gold and potions, but present card choices to agent
                 var cardRewards = new List<CardReward>();
+                var potionRewards = new List<Dictionary<string, object?>>();
                 foreach (var reward in rewards)
                 {
-                    if (reward is GoldReward || reward is MegaCrit.Sts2.Core.Rewards.RelicReward
-                        || reward is MegaCrit.Sts2.Core.Rewards.PotionReward)
+                    if (reward is GoldReward or RelicReward or PotionReward)
                     {
-                        try { reward.SelectUnsynchronized().GetAwaiter().GetResult(); _syncCtx.Pump(); }
+                        HashSet<PotionModel>? potionsBefore = reward is PotionReward
+                            ? player.Potions?.Where(p => p != null).ToHashSet() ?? new()
+                            : null;
+                        try
+                        {
+                            reward.SelectUnsynchronized().GetAwaiter().GetResult();
+                            _syncCtx.Pump();
+                            if (potionsBefore != null)
+                                potionRewards.AddRange(NewPotionRewards(player, potionsBefore));
+                        }
                         catch (Exception ex) { Log($"Auto-collect reward: {ex.Message}"); }
                     }
                     else if (reward is CardReward cr)
@@ -2940,6 +3006,7 @@ public class RunSimulator
                 {
                     _pendingCardReward = cardRewards[0];
                     _pendingRewards = rewards;
+                    _pendingAutoRewards = potionRewards;
                     return CardRewardState(player, combatRoom);
                 }
 
@@ -2951,6 +3018,7 @@ public class RunSimulator
         // No more pending rewards - proceed
         _pendingCardReward = null;
         _pendingRewards = null;
+        _pendingAutoRewards = null;
         _rewardsProcessed = true;
 
         // Boss -> next act, OR final victory after the last act's boss (#81). Act index is
@@ -3013,8 +3081,17 @@ public class RunSimulator
             ["cards"] = cards,
             ["can_skip"] = _pendingCardReward.CanSkip,
             ["gold_earned"] = _runState!.Players[0].Gold - _goldBeforeCombat,
+            ["rewards"] = _pendingAutoRewards?.Count > 0 ? _pendingAutoRewards : null,
             ["player"] = PlayerSummary(_runState!.Players[0]),
         };
+    }
+
+    private List<Dictionary<string, object?>> NewPotionRewards(Player player, HashSet<PotionModel> potionsBefore)
+    {
+        return player.Potions?
+            .Where(p => p != null && !potionsBefore.Contains(p))
+            .Select(p => PotionSummary(p))
+            .ToList() ?? new();
     }
 
     private void ForceToMap()
@@ -3146,7 +3223,7 @@ public class RunSimulator
                         optDesc = rd;
                 }
 
-                var optVars = BuildEventOptionVars(localEvent.DynamicVars?.Values, opt, opt.TextKey);
+                var optVars = BuildEventOptionVars(localEvent, opt);
 
                 return new Dictionary<string, object?>
                 {
@@ -3186,20 +3263,18 @@ public class RunSimulator
         };
     }
 
-    private Dictionary<string, object?>? BuildEventOptionVars(
-        System.Collections.IEnumerable? eventVars,
-        object option,
-        string? textKey)
+    private Dictionary<string, object?>? BuildEventOptionVars(EventModel localEvent, EventOption option)
     {
         var vars = new Dictionary<string, object?>();
 
-        try { if (eventVars != null) _displayVars.AddDynamicVars(vars, eventVars); }
+        try { if (localEvent.DynamicVars?.Values != null) _displayVars.AddDynamicVars(vars, localEvent.DynamicVars.Values); }
         catch { }
 
         try { _displayVars.AddEventOptionVars(vars, option); }
         catch { }
 
-        AddRelicOptionFallbackVars(vars, textKey);
+        AddRelicOptionFallbackVars(vars, option.TextKey);
+        AddPotionOptionVars(vars, localEvent, option);
         ResolveRandomCardVar(vars);
 
         return vars.Count > 0 ? vars : null;
@@ -3219,6 +3294,42 @@ public class RunSimulator
             _displayVars.AddDynamicVars(vars, relicModel.ToMutable().DynamicVars.Values);
         }
         catch { }
+    }
+
+    private void AddPotionOptionVars(Dictionary<string, object?> vars, EventModel localEvent, EventOption option)
+    {
+        var potion = PotionFromOptionCallback(option);
+        if (potion == null) return;
+
+        vars.TryAdd("Potion", _loc.Potion(potion.Id.Entry));
+        vars.TryAdd("Rarity", _loc.Bilingual(
+            "gameplay_ui", $"POTION_RARITY.{potion.Rarity.ToString().ToUpperInvariant()}"));
+
+        if (ReadMember(localEvent, "PotionToCardType") is not System.Collections.IDictionary cardTypes ||
+            !cardTypes.Contains(potion))
+            return;
+
+        var cardType = cardTypes[potion]?.ToString();
+        if (!string.IsNullOrWhiteSpace(cardType))
+            vars.TryAdd("Type", _loc.Bilingual(
+                "gameplay_ui", $"CARD_TYPE.{cardType.ToUpperInvariant()}"));
+    }
+
+    private static PotionModel? PotionFromOptionCallback(EventOption option)
+    {
+        if (ReadMember(option, "OnChosen") is not Delegate onChosen || onChosen.Target == null)
+            return null;
+
+        var fields = onChosen.Target.GetType().GetFields(
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        return fields.Select(field => field.GetValue(onChosen.Target)).OfType<PotionModel>().FirstOrDefault();
+    }
+
+    private static object? ReadMember(object obj, string name)
+    {
+        var flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+        return obj.GetType().GetProperty(name, flags)?.GetValue(obj)
+            ?? obj.GetType().GetField(name, flags)?.GetValue(obj);
     }
 
     private void ResolveRandomCardVar(Dictionary<string, object?> vars)
@@ -3348,6 +3459,7 @@ public class RunSimulator
         }).ToList();
 
         var removal = merchantRoom.GetLocalInventory().CardRemovalEntry;
+        var removalAvailable = removal != null && !_shopCardRemovalPurchased && !_shopCardRemovalPending;
 
         return new Dictionary<string, object?>
         {
@@ -3357,7 +3469,7 @@ public class RunSimulator
             ["cards"] = cards,
             ["relics"] = relics,
             ["potions"] = potions,
-            ["card_removal_cost"] = removal?.Cost,
+            ["card_removal_cost"] = removalAvailable ? removal?.Cost : null,
             ["player"] = PlayerSummary(player),
         };
     }
@@ -3616,20 +3728,10 @@ public class RunSimulator
                     ["vars"] = vars.Count > 0 ? vars : null,
                 };
             }).ToList(),
-            ["potions"] = player.Potions?.Select((p, i) =>
-            {
-                if (p == null) return null;
-                var pvars = new Dictionary<string, object?>();
-                try { _displayVars.AddDynamicVars(pvars, p.DynamicVars.Values); } catch { }
-                return new Dictionary<string, object?>
-                {
-                    ["index"] = i,
-                    ["name"] = _loc.Potion(p.Id.Entry),
-                    ["description"] = _loc.Bilingual("potions", p.Id.Entry + ".description"),
-                    ["vars"] = pvars.Count > 0 ? pvars : null,
-                    ["target_type"] = p.TargetType.ToString(),
-                };
-            }).Where(x => x != null).ToList(),
+            ["potions"] = player.Potions?
+                .Select((p, i) => p == null ? null : PotionSummary(p, i))
+                .Where(p => p != null)
+                .ToList(),
             ["deck_size"] = player.Deck?.Cards?.Count(c => c != null) ?? 0,
             ["deck"] = player.Deck?.Cards?.Where(c => c != null).Select(c =>
             {
@@ -3663,6 +3765,23 @@ public class RunSimulator
                 return dcard;
             }).ToList(),
         };
+    }
+
+    private static Dictionary<string, object?> PotionSummary(PotionModel p, int index = -1)
+    {
+        var vars = new Dictionary<string, object?>();
+        try { _displayVars.AddDynamicVars(vars, p.DynamicVars.Values); } catch { }
+        var summary = new Dictionary<string, object?>
+        {
+            ["reward_type"] = "potion",
+            ["name"] = _loc.Potion(p.Id.Entry),
+            ["description"] = _loc.Bilingual("potions", p.Id.Entry + ".description"),
+            ["vars"] = vars.Count > 0 ? vars : null,
+            ["target_type"] = p.TargetType.ToString(),
+        };
+        if (index >= 0)
+            summary["index"] = index;
+        return summary;
     }
 
     /// <summary>Common context added to every decision point.</summary>

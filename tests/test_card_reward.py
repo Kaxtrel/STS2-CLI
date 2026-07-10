@@ -47,3 +47,16 @@ class TestCardReward:
         state = game.act("skip_card_reward")
         deck_after = state.get("player", {}).get("deck_size", deck_before)
         assert deck_after == deck_before
+
+    def test_potion_reward_is_reported_without_slot_index(self, game):
+        state = game.start(seed="potion-reward-5", lang="zh")
+        game.skip_neow(state)
+        game.set_player(potions=[])
+        state = game.enter_room("combat", encounter="SHRINKER_BEETLE_WEAK")
+        state = game.auto_play_combat(state)
+
+        assert state["decision"] == "card_reward"
+        rewards = state.get("rewards") or []
+        assert len(rewards) == 1
+        assert rewards[0]["reward_type"] == "potion"
+        assert "index" not in rewards[0]

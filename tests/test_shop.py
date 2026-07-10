@@ -96,3 +96,22 @@ class TestShopRemove:
             # Should return to shop with deck_size - 1
             if state.get("decision") == "shop":
                 assert state["player"]["deck_size"] == deck_before - 1
+
+    def test_remove_card_once_per_shop(self, game):
+        state = game.start(seed="rm-final")
+        game.skip_neow(state)
+        game.set_player(gold=999)
+        state = game.enter_room("shop")
+        deck_before = state["player"]["deck_size"]
+
+        state = game.act("remove_card")
+        assert state["decision"] == "card_select"
+        state = game.act("select_cards", indices="0")
+
+        assert state["decision"] == "shop"
+        assert state["player"]["deck_size"] == deck_before - 1
+        assert state.get("card_removal_cost") is None
+
+        state = game.act("remove_card")
+        assert state["type"] == "error"
+        assert "already purchased" in state["message"]
